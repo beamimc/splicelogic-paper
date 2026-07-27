@@ -7,17 +7,21 @@ cfg     <- jsonlite::read_json("benchmarks/results/grid_config.json")
 BL      <- cfg$baseline
 
 panel_labels <- c(
-  n_genes     = "Genes",
-  event_ratio = "Event ratio"
+  n_genes        = "Genes",
+  event_ratio    = "Event ratio",
+  n_pos_per_gene = "Pos tx / gene"
 )
 
 plot_data <- bind_rows(
   results |>
-    filter(event_ratio == BL$event_ratio) |>
+    filter(event_ratio == BL$event_ratio, n_pos_per_gene == BL$n_pos_per_gene) |>
     mutate(focal_dim = "n_genes", focal_value = n_genes),
   results |>
-    filter(n_genes == BL$n_genes) |>
-    mutate(focal_dim = "event_ratio", focal_value = event_ratio)
+    filter(n_genes == BL$n_genes, n_pos_per_gene == BL$n_pos_per_gene) |>
+    mutate(focal_dim = "event_ratio", focal_value = event_ratio),
+  results |>
+    filter(n_genes == BL$n_genes, event_ratio == BL$event_ratio) |>
+    mutate(focal_dim = "n_pos_per_gene", focal_value = n_pos_per_gene)
 ) |>
   mutate(
     focal_dim = factor(focal_dim, levels = names(panel_labels)),
@@ -35,9 +39,9 @@ p <- ggplot(plot_data, aes(x = focal_value, y = median_ms, color = type)) +
   scale_color_brewer(palette = "Set2", name = "Match type") +
   labs(
     title    = "find_se() runtime by gene count and event density",
-    subtitle = sprintf("FX: %d tx/gene, %d exons/tx; BL: %d genes, %.0f%% event ratio",
-                       cfg$fixed_n_tx_per_gene, cfg$fixed_n_exons_per_tx,
-                       BL$n_genes, BL$event_ratio * 100),
+    subtitle = sprintf("FX: %d exons/tx; BL: %d genes, %.0f%% event ratio, %d pos tx/gene",
+                       cfg$fixed_n_exons_per_tx,
+                       BL$n_genes, BL$event_ratio * 100, BL$n_pos_per_gene),
     x = NULL,
     y = "Median runtime (ms)"
   ) +
