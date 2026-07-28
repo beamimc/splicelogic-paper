@@ -91,3 +91,22 @@ message(sprintf("Total compute (sum of median × n_itr): %.2f s", total_s))
 
 write.csv(results, "benchmarks/results/bench_find_se.csv", row.names = FALSE)
 message("Saved → benchmarks/results/bench_find_se.csv")
+
+# Single-iteration check at baseline: verify detected events match injected events
+n_events_check <- round(baseline$event_ratio * baseline$n_genes)
+gr_check <- create_mock_data(
+  n_genes        = baseline$n_genes,
+  n_tx_per_gene  = baseline$n_pos_per_gene + 1L,
+  n_exons_per_tx = fixed_n_exons_per_tx
+)
+gr_check <- generate_se(gr_check, n_events = n_events_check)
+neg_tx_ids_check <- as.data.frame(gr_check) |>
+  group_by(gene_id) |>
+  summarise(tx_id = min(tx_id), .groups = "drop") |>
+  pull(tx_id)
+gr_check <- gr_check |>
+  mutate(estimate = if_else(estimate < 0 & !tx_id %in% neg_tx_ids_check,
+                            abs(estimate), estimate))
+res_check <- find_se(gr_check, type = "boundary")
+message("Injected (sim_event in input):");  print(table(gr_check$sim_event))
+message("Detected (sim_event in result):"); print(table(res_check$sim_event))

@@ -47,3 +47,8 @@ bm <- bench::mark(
 )
 
 print(bm)
+
+# Single-iteration check: verify detected events match injected events
+res <- find_ri(gr)
+message("Injected (sim_event in input):");  print(table(gr$sim_event))
+message("Detected (sim_event in result):"); print(table(res$sim_event))

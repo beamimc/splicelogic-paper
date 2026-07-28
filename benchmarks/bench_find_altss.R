@@ -58,6 +58,8 @@ bm3 <- bench::mark(
 print(bm3)
 
 res_a5 <- find_a5ss(gr_a5)
+table(gr_a5$sim_event)
+table(res_a5$sim_event)
+
 res_a3 <- find_a3ss(gr_a3)
-res_a5
 res_a3
