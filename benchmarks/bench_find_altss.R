@@ -39,27 +39,21 @@ gr_base <- gr_base |>
 gr_a5 <- generate_a5ss(gr_base, n_events = n_events)
 gr_a3 <- generate_a3ss(gr_base, n_events = n_events)
 
-bm5 <- bench::mark(
-  find_a5ss(gr_a5),
+bm <- bench::mark(
+  a5ss = find_a5ss(gr_a5),
+  a3ss = find_a3ss(gr_a3),
   iterations = 20,
   time_unit  = "s",
   filter_gc  = TRUE
 )
 
-print(bm5)
+print(bm)
 
-bm3 <- bench::mark(
-  find_a3ss(gr_a3),
-  iterations = 20,
-  time_unit  = "s",
-  filter_gc  = TRUE
-)
-
-print(bm3)
-
+# Single-iteration check: verify detected events match injected events
 res_a5 <- find_a5ss(gr_a5)
-table(gr_a5$sim_event)
-table(res_a5$sim_event)
+message("a5ss injected (sim_event in input):");  print(table(gr_a5$sim_event))
+message("a5ss detected (sim_event in result):"); print(table(res_a5$sim_event))
 
 res_a3 <- find_a3ss(gr_a3)
-res_a3
+message("a3ss injected (sim_event in input):");  print(table(gr_a3$sim_event))
+message("a3ss detected (sim_event in result):"); print(table(res_a3$sim_event))
