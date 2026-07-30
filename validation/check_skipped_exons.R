@@ -1,6 +1,4 @@
 library(here)
-library(txdbmaker)
-library(GenomicFeatures)
 devtools::load_all(here("../splicelogic"))
 library(BSgenome.Hsapiens.NCBI.GRCh38)
 library(plyranges)
@@ -10,21 +8,30 @@ library(dplyr)
 
 gtf <- here("validation/biosurfer/gencode.v42.annotation.gtf.gz")
 db_path <- here("validation/biosurfer/gencode.v42.TxDb.sqlite")
+txps_rds <- here("validation/biosurfer/txps.rds")
+ebt_rds <- here("validation/biosurfer/ebt.rds")
 
-# txdb <- makeTxDbFromGFF(gtf, format = "gtf")
-# saveDb(txdb, file = db_path)
+if (file.exists(txps_rds) && file.exists(ebt_rds)) {
+  txps <- readRDS(txps_rds)
+  ebt <- readRDS(ebt_rds)
+} else {
+  library(txdbmaker)
+  library(GenomicFeatures)
+  # txdb <- makeTxDbFromGFF(gtf, format = "gtf")
+  # saveDb(txdb, file = db_path)
+  txdb <- loadDb(db_path)
+  txps <- transcripts(txdb)
+  # transcript_name (e.g. "DDX11L2-202") is not stored in TxDb; recover from GTF
+  gtf_gr <- rtracklayer::import(gtf, feature.type = "transcript")
+  tx_name_map <- setNames(gtf_gr$transcript_name, gtf_gr$transcript_id)
+  txps$transcript_name <- tx_name_map[txps$tx_name]
+  ebt <- exonsBy(txdb, by = "tx")
+  saveRDS(txps, txps_rds)
+  saveRDS(ebt, ebt_rds)
+}
 
-txdb <- loadDb(db_path)
-
-txps <- transcripts(txdb)
-
-# transcript_name (e.g. "DDX11L2-202") is not stored in TxDb; recover from GTF
-gtf_gr <- rtracklayer::import(gtf, feature.type = "transcript")
-tx_name_map <- setNames(gtf_gr$transcript_name, gtf_gr$transcript_id)
-txps$transcript_name <- tx_name_map[txps$tx_name]
-
+# load the H.s. genome
 bsg <- BSgenome.Hsapiens.NCBI.GRCh38
-ebt <- exonsBy(txdb, by = "tx")
 
 # --- 100 simple SE cases ---------------------------------------------------
 
