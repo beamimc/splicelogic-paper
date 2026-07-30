@@ -83,27 +83,27 @@ for (i in seq_len(nrow(sample_cases))) {
   exon_list[[i]] <- c(anchor_exons, other_exons)
 }
 
-gr <- do.call(c, Filter(Negate(is.null), exon_list)) |>
+gr <- bind_ranges(exon_list) |>
   preprocess(coef_col = "estimate")
 
 se_all <- find_se(gr, type = "boundary")
 
-# check results per case
-n_success <- 0L
+GenomeInfoDb::seqlevelsStyle(se_all) <- "NCBI"
 
-for (i in seq_len(nrow(sample_cases))) {
-  row <- sample_cases[i, ]
+se_all <- se_all %>%
+  mutate(
+    dna = get_seq(., bsg),
+    aastring = translate(dna),
+    aa = as.character(aastring)
+  )
 
-  se <- se_all[se_all$case_id == i]
-  if (length(se) == 0) next
-  if (BiocGenerics::width(se) != row$aa_loss * 3) next
+results <- as_tibble(se_all) |>
+  left_join(
+    mutate(sample_cases, case_id = row_number()) |>
+      select(case_id, anchor_seq, aa_loss),
+    by = "case_id"
+  ) |>
+  filter(width == aa_loss * 3)
 
-  skipped <- se
-  GenomeInfoDb::seqlevelsStyle(skipped) <- "NCBI"
-  dna <- get_seq(skipped, bsg)
-  aa <- as.character(translate(dna))
-
-  if (aa == row$anchor_seq) n_success <- n_success + 1L
-}
-
+n_success <- sum(results$aa == results$anchor_seq, na.rm = TRUE)
 message(n_success, " / ", nrow(sample_cases), " SE cases matched biosurfer anchor_seq")
