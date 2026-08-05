@@ -11,11 +11,23 @@ db_path <- here("validation/biosurfer/gencode.v42.TxDb.sqlite")
 txps_rds <- here("validation/biosurfer/txps.rds")
 cbt_rds <- here("validation/biosurfer/cbt.rds")
 
+if (!file.exists(gtf)) {
+  download.file(
+    "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_42/gencode.v42.annotation.gtf.gz",
+    destfile = gtf
+  )
+}
+
+if (!file.exists(db_path)) {
+  library(txdbmaker)
+  txdb <- txdbmaker::makeTxDbFromGFF(gtf, format = "gtf")
+  AnnotationDbi::saveDb(txdb, db_path)
+}
+
 if (file.exists(txps_rds) && file.exists(cbt_rds)) {
   txps <- readRDS(txps_rds)
   cbt <- readRDS(cbt_rds)
 } else {
-  library(txdbmaker)
   library(GenomicFeatures)
   txdb <- AnnotationDbi::loadDb(db_path)
   txps <- GenomicFeatures::transcripts(txdb)
@@ -109,7 +121,8 @@ n_phase0 <- as_tibble(se_phase0) |>
              by = c("tx_id" = "anchor", "event_tx_id" = "other")) |>
   distinct(tx_id, event_tx_id) |>
   nrow()
-n_non_phase0 <- n_found - n_phase0
+
+#n_non_phase0 <- n_found - n_phase0
 
 se_phase0 <- se_phase0 %>%
   mutate(
@@ -127,8 +140,62 @@ results <- as_tibble(se_phase0) |>
 
 n_width_mismatch <- n_phase0 - nrow(results)
 n_success <- sum(results$aa == results$anchor_seq, na.rm = TRUE)
+
+# --- Non-phase-0 SE validation (trimmed inner AA) ---------------------------
+# For exons where the cumulative CDS at the exon start is not divisible by 3,
+# both boundaries split a codon. Trim the leading (3 - phase) nt and enough
+# trailing nt to reach the next codon boundary; the remaining inner sequence
+# is fully in-frame and comparable to biosurfer's anchor_seq minus the one
+# split-codon AA that biosurfer includes at the leading boundary.
+# phase 1 → biosurfer anchor_seq[1] is the split AA → compare to anchor_seq[2:]
+# phase 2 → biosurfer anchor_seq[end] is the split AA → compare to anchor_seq[:-1]
+
+se_nonphase0 <- se_all[
+  !is.na(se_all$phase_vec) & se_all$phase_vec != 0L & width(se_all) %% 3L == 0L
+]
+GenomeInfoDb::seqlevelsStyle(se_nonphase0) <- "NCBI"
+
+se_nonphase0 <- se_nonphase0 %>%
+  mutate(
+    dna_full   = get_seq(., bsg),
+    trim_start = (3L - phase_vec) %% 3L,
+    dna_inner  = subseq(dna_full,
+                        start = trim_start + 1L,
+                        width = ((width - trim_start) %/% 3L) * 3L),
+    aa_inner   = as.character(translate(dna_inner, no.init.codon = TRUE))
+  )
+
+results_nonphase0 <- as_tibble(se_nonphase0) |>
+  inner_join(
+    sample_cases |> select(anchor, other, anchor_seq, aa_loss),
+    by = c("tx_id" = "anchor", "event_tx_id" = "other")
+  ) |>
+  filter(width == aa_loss * 3) |>
+  distinct(tx_id, event_tx_id, .keep_all = TRUE) |>
+  mutate(
+    anchor_inner = if_else(
+      phase_vec == 1L,
+      substr(anchor_seq, 2L, nchar(anchor_seq)),
+      substr(anchor_seq, 1L, nchar(anchor_seq) - 1L)
+    )
+  )
+
+n_nonphase0_success <- sum(
+  results_nonphase0$aa_inner == results_nonphase0$anchor_inner,
+  na.rm = TRUE
+)
+
+# --- Summary ----------------------------------------------------------------
+
 message(
-  n_non_phase0, " / ", nrow(sample_cases), " cases: non-phase-0, excluded\n",
-  n_width_mismatch, " / ", nrow(sample_cases), " cases: phase-0 but width != aa_loss * 3\n",
-  n_success, " / ", nrow(results), " testable cases matched biosurfer anchor_seq"
+  "Phase-0 validation\n",
+  "  ", n_phase0, " / ", nrow(sample_cases), " cases: phase-0 and testable\n",
+  "  ", n_width_mismatch, " / ", nrow(sample_cases), " cases: phase-0 but width != aa_loss * 3\n",
+  "  ", n_success, " / ", nrow(results), " testable cases matched biosurfer anchor_seq\n",
+  "\n",
+  "Non-phase-0 validation (inner sequence, split-codon AAs trimmed)\n",
+  "  ", nrow(results_nonphase0), " / ", nrow(sample_cases),
+      " cases: non-phase-0, width divisible by 3, testable\n",
+  "  ", n_nonphase0_success, " / ", nrow(results_nonphase0),
+      " testable cases matched biosurfer anchor_seq (inner)"
 )

@@ -5,3 +5,4 @@ validation/biosurfer/biosurfer.pdf
 validation/biosurfer/biosurfer.txt
 validation/biosurfer/gencode.v42.*
 *.rds
+*.tar.gz
