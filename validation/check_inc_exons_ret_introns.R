@@ -37,15 +37,16 @@ ie_cases <- pblocks |>
 set.seed(5)
 sample_ie <- slice_sample(ie_cases, n = 100)
 
-# --- RI cases (B: intron retained in other, spliced out in anchor) ----------
+# --- RI cases (b: intron retained in anchor, spliced out in other) ----------
+# anchor=up (has the big retaining exon), other=down (has the split exons)
 
 ri_cases <- pblocks |>
   filter(
-    events == "frozenset({'B'})",
+    events == "frozenset({'b'})",
     !compound_splicing,
     !frameshift,
     !split_codons,
-    aa_gain > 0
+    aa_loss > 0
   ) |>
   group_by(anchor, other) |>
   filter(dplyr::n() == 1) |>
@@ -72,7 +73,7 @@ GenomeInfoDb::seqlevelsStyle(ie_all) <- "NCBI"
 ri_anchor_gr <- make_cds_gr(unique(sample_ri$anchor), txps, cbt)
 ri_other_gr <- make_cds_gr(unique(sample_ri$other), txps, cbt)
 
-ri_gr <- prepare_exons_by_partition(up = ri_other_gr, down = ri_anchor_gr) |>
+ri_gr <- prepare_exons_by_partition(up = ri_anchor_gr, down = ri_other_gr) |>
   preprocess(coef_col = "estimate")
 
 ri_all <- find_ri(ri_gr)
