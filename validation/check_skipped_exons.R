@@ -67,25 +67,7 @@ se_cases <- pblocks |>
 set.seed(5)
 sample_cases <- slice_sample(se_cases, n = 100)
 
-# build CDS GRanges for each unique anchor (down) and other (up) transcript;
-# re-number exon_rank to 1:n because cdsBy ranks reflect the full transcript
-# (may skip non-coding exons), which would break preprocess()'s internal flag
-# and rank ± 1 neighbor key lookup
-make_cds_gr <- function(tx_names, txps, cbt) {
-  exon_list <- vector("list", length(tx_names))
-  for (i in seq_along(tx_names)) {
-    tx_name <- tx_names[i]
-    txid <- txps$tx_id[txps$transcript_name == tx_name]
-    if (length(txid) == 0) next
-    cds <- cbt[[as.character(txid)]]
-    if (is.null(cds)) next
-    cds$exon_rank <- seq_along(cds)
-    mcols(cds)$tx_id <- tx_name
-    mcols(cds)$gene_id <- sub("-\\d+$", "", tx_name)
-    exon_list[[i]] <- cds
-  }
-  bind_ranges(exon_list)
-}
+source(here("validation/utils.R"))
 
 anchor_gr <- make_cds_gr(unique(sample_cases$anchor), txps, cbt)
 other_gr <- make_cds_gr(unique(sample_cases$other), txps, cbt)
