@@ -1,14 +1,14 @@
-make_cds_gr <- function(tx_names, txps, cbt) {
+make_cds_gr <- function(tx_names, txps, grl) {
   exon_list <- vector("list", length(tx_names))
   for (i in seq_along(tx_names)) {
     tx_name <- tx_names[i]
     txid <- txps$tx_id[txps$transcript_name == tx_name]
     if (length(txid) == 0) next
-    cds <- cbt[[as.character(txid)]]
-    if (is.null(cds)) next
-    mcols(cds)$tx_id <- tx_name
-    mcols(cds)$gene_id <- sub("-\\d+$", "", tx_name)
-    exon_list[[i]] <- cds
+    gr <- grl[[as.character(txid)]]
+    if (is.null(gr)) next
+    mcols(gr)$tx_id <- tx_name
+    mcols(gr)$gene_id <- sub("-\\d+$", "", tx_name)
+    exon_list[[i]] <- gr
   }
   bind_ranges(exon_list)
 }

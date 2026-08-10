@@ -10,6 +10,7 @@ gtf <- here("validation/biosurfer/gencode.v42.annotation.gtf.gz")
 db_path <- here("validation/biosurfer/gencode.v42.TxDb.sqlite")
 txps_rds <- here("validation/biosurfer/txps.rds")
 cbt_rds <- here("validation/biosurfer/cbt.rds")
+ebt_rds <- here("validation/biosurfer/ebt.rds")
 
 if (!file.exists(gtf)) {
   download.file(
@@ -24,9 +25,10 @@ if (!file.exists(db_path)) {
   AnnotationDbi::saveDb(txdb, db_path)
 }
 
-if (file.exists(txps_rds) && file.exists(cbt_rds)) {
+if (file.exists(txps_rds) && file.exists(cbt_rds) & file.exists(ebt_rds)) {
   txps <- readRDS(txps_rds)
   cbt <- readRDS(cbt_rds)
+  ebt <- readRDS(ebt_rds)
 } else {
   library(GenomicFeatures)
   txdb <- AnnotationDbi::loadDb(db_path)
@@ -36,8 +38,10 @@ if (file.exists(txps_rds) && file.exists(cbt_rds)) {
   tx_name_map <- setNames(gtf_gr$transcript_name, gtf_gr$transcript_id)
   txps$transcript_name <- tx_name_map[txps$tx_name]
   cbt <- GenomicFeatures::cdsBy(txdb, by = "tx")
+  ebt  <- GenomicFeatures::exonsBy(txdb, by = "tx")
   saveRDS(txps, txps_rds)
   saveRDS(cbt, cbt_rds)
+  saveRDS(ebt, ebt_rds)
 }
 
 # load the H.s. genome
