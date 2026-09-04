@@ -37,7 +37,7 @@ ie_cases <- pblocks |>
   ungroup()
 
 set.seed(5)
-sample_ie <- slice_sample(ie_cases, n = 500)
+sample_ie <- slice_sample(ie_cases, n = 2000)
 
 # --- RI cases (I: anchor splices out intron, other retains it) --------------
 # other=up (has the big retaining exon), anchor=down (has the split exons)
@@ -55,7 +55,7 @@ ri_cases <- pblocks |>
   ungroup()
 
 set.seed(5)
-sample_ri <- slice_sample(ri_cases, n = 500)
+sample_ri <- slice_sample(ri_cases, n = 2000)
 
 source(here("validation/utils.R"))
 
@@ -130,11 +130,12 @@ ie_phase0 <- ie_all[
   !is.na(ie_all$phase_vec) & ie_all$phase_vec == 0L & width(ie_all) %% 3L == 0L
 ]
 
-n_ie_phase0 <- as_tibble(ie_phase0) |>
+ie_phase0_pairs <- as_tibble(ie_phase0) |>
   inner_join(sample_ie |> select(anchor, other),
              by = c("tx_id" = "other", "event_tx_id" = "anchor")) |>
-  distinct(tx_id, event_tx_id) |>
-  nrow()
+  distinct(tx_id, event_tx_id)
+
+n_ie_phase0 <- nrow(ie_phase0_pairs)
 
 ie_phase0 <- ie_phase0 %>%
   mutate(
@@ -175,8 +176,13 @@ ie_results_nonphase0 <- as_tibble(ie_nonphase0) |>
     sample_ie |> select(anchor, other, other_seq, aa_gain),
     by = c("tx_id" = "other", "event_tx_id" = "anchor")
   ) |>
-  filter(width == aa_gain * 3) |>
-  distinct(tx_id, event_tx_id, .keep_all = TRUE) |>
+  # exclude selenoproteins: biosurfer records selenocysteine as U, but
+  # Biostrings::translate() uses the standard genetic code and returns * for UGA
+  filter(width == aa_gain * 3, !grepl("U", other_seq)) |>
+  anti_join(ie_phase0_pairs, by = c("tx_id", "event_tx_id")) |>
+  group_by(tx_id, event_tx_id) |>
+  filter(n() == 1) |>
+  ungroup() |>
   mutate(
     other_inner = if_else(
       phase_vec == 1L,
@@ -190,6 +196,12 @@ n_ie_nonphase0_success <- sum(
   na.rm = TRUE
 )
 
+# --- IE diagnostics ----------------------------------------------------------
+
+failures_ie_nonphase0 <- ie_results_nonphase0 |>
+  filter(aa_inner != other_inner | is.na(aa_inner)) |>
+  select(tx_id, event_tx_id, phase_vec, width, aa_gain, aa_inner, other_inner, other_seq)
+
 # --- IE summary --------------------------------------------------------------
 
 message(
@@ -200,8 +212,7 @@ message(
   "\n",
   "IE Non-phase-0 validation (inner sequence, split-codon AAs trimmed)\n",
   "  ", nrow(ie_results_nonphase0), " / ", nrow(sample_ie),
-      " cases: non-phase-0, width divisible by 3, testable\n",
+      " cases: non-phase-0, width divisible by 3, single inclusion, testable\n",
   "  ", n_ie_nonphase0_success, " / ", nrow(ie_results_nonphase0),
       " testable cases matched biosurfer other_seq (inner)"
 )
-

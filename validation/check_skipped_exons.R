@@ -69,7 +69,7 @@ se_cases <- pblocks |>
   ungroup()
 
 set.seed(5)
-sample_cases <- slice_sample(se_cases, n = 100)
+sample_cases <- slice_sample(se_cases, n = 2000)
 
 source(here("validation/utils.R"))
 
@@ -102,11 +102,12 @@ se_all$phase_vec <- sum(width(preceding)) %% 3L
 # in-frame translation comparable to biosurfer anchor_seq
 se_phase0 <- se_all[!is.na(se_all$phase_vec) & se_all$phase_vec == 0L & width(se_all) %% 3L == 0L]
 
-n_phase0 <- as_tibble(se_phase0) |>
+phase0_pairs <- as_tibble(se_phase0) |>
   inner_join(sample_cases |> select(anchor, other),
              by = c("tx_id" = "anchor", "event_tx_id" = "other")) |>
-  distinct(tx_id, event_tx_id) |>
-  nrow()
+  distinct(tx_id, event_tx_id)
+
+n_phase0 <- nrow(phase0_pairs)
 
 #n_non_phase0 <- n_found - n_phase0
 
@@ -156,8 +157,13 @@ results_nonphase0 <- as_tibble(se_nonphase0) |>
     sample_cases |> select(anchor, other, anchor_seq, aa_loss),
     by = c("tx_id" = "anchor", "event_tx_id" = "other")
   ) |>
-  filter(width == aa_loss * 3) |>
-  distinct(tx_id, event_tx_id, .keep_all = TRUE) |>
+  # exclude selenoproteins: biosurfer records selenocysteine as U, but
+  # Biostrings::translate() uses the standard genetic code and returns * for UGA
+  filter(width == aa_loss * 3, !grepl("U", anchor_seq)) |>
+  anti_join(phase0_pairs, by = c("tx_id", "event_tx_id")) |>
+  group_by(tx_id, event_tx_id) |>
+  filter(n() == 1) |>
+  ungroup() |>
   mutate(
     anchor_inner = if_else(
       phase_vec == 1L,
@@ -171,6 +177,13 @@ n_nonphase0_success <- sum(
   na.rm = TRUE
 )
 
+# --- Diagnostics ------------------------------------------------------------
+
+# Non-phase-0 failures
+failures_nonphase0 <- results_nonphase0 |>
+  filter(aa_inner != anchor_inner | is.na(aa_inner)) |>
+  select(tx_id, event_tx_id, phase_vec, width, aa_loss, aa_inner, anchor_inner, anchor_seq)
+
 # --- Summary ----------------------------------------------------------------
 
 message(
@@ -181,7 +194,8 @@ message(
   "\n",
   "Non-phase-0 validation (inner sequence, split-codon AAs trimmed)\n",
   "  ", nrow(results_nonphase0), " / ", nrow(sample_cases),
-      " cases: non-phase-0, width divisible by 3, testable\n",
+      " cases: non-phase-0, width divisible by 3, single skip, testable\n",
   "  ", n_nonphase0_success, " / ", nrow(results_nonphase0),
       " testable cases matched biosurfer anchor_seq (inner)"
 )
+
