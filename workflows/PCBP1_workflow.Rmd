@@ -1,0 +1,568 @@
+---
+title: "PCBP1 workflow"
+output: html_document
+---
+
+Data: "Iron-sensitive RNA regulation by poly C binding proteins" (PMID 41036621),
+two GEO series of K562 short-read RNA-seq (polyA, paired-end 150), three
+biological replicates per condition, quantified with Salmon (v1.10.2) against
+GENCODE v43:
+
+- [GSE279951](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE279951)
+  [P1KD]: shRNA against luciferase (`shCtrl`) or PCBP1 (`shPCBP1`).
+- [GSE279949](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE279949)
+  [chelator]: DMSO (control) or iron chelator 21H7 (`CHEL`), overnight.
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(splicelogic)
+library(SummarizedExperiment)
+library(GenomicFeatures)
+library(dplyr)
+library(ggplot2)
+library(satuRn)
+library(limma)
+library(tibble)
+library(tximeta)
+library(here)
+devtools::load_all(here("../splicelogic"))
+```
+
+## Download data
+
+GEO bundles one Salmon `quant.sf` per sample into a `RAW.tar` per series
+(~21MB each). They are extracted into `workflows/data/PCBP1/<GSE>/`.
+
+GEO has only the `quant.sf` files, but tximeta also needs the Salmon
+`aux_info/meta_info.json` (it identifies the transcriptome from the index hash
+stored there). The authors' `meta_info.json` is not on GEO: place it at
+`workflows/data/PCBP1/meta_info.json` and it is copied into an `aux_info/`
+folder next to the quant files of each series (same Salmon index for both).
+
+```{r download_data, eval=FALSE}
+options(timeout = 600)
+geo_dir <- here("workflows/data/PCBP1")
+for (gse in c("GSE279949", "GSE279951")) {
+  dest <- file.path(geo_dir, gse)
+  dir.create(dest, recursive = TRUE, showWarnings = FALSE)
+  tar_file <- file.path(dest, paste0(gse, "_RAW.tar"))
+  download.file(
+    paste0("https://ftp.ncbi.nlm.nih.gov/geo/series/GSE279nnn/", gse,
+           "/suppl/", gse, "_RAW.tar"),
+    tar_file, mode = "wb"
+  )
+  untar(tar_file, exdir = dest)
+  file.remove(tar_file)
+  dir.create(file.path(dest, "aux_info"), showWarnings = FALSE)
+  file.copy(file.path(geo_dir, "meta_info.json"), file.path(dest, "aux_info"))
+}
+list.files(geo_dir, recursive = TRUE)
+```
+
+```{r txdb, eval=FALSE}
+library(txdbmaker)
+# load TxDb for GRanges conversion
+# the quant.sf files use GENCODE v43 transcript IDs (with version), so build the
+# TxDb from the same release: the v48 TxDb would drop transcripts whose version changed
+# download once (warning: ~50MB compressed, slow from EBI)
+gtf <- here("workflows/data/gencode.v43.annotation.gtf.gz")
+# curl with -C - resumes a partial file (EBI often times out mid-transfer);
+# --retry re-attempts on failure instead of restarting from zero
+system2("curl", c("-C", "-", "-L", "--retry", "5", "--retry-delay", "5",
+                  "-o", shQuote(gtf),
+                  "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_43/gencode.v43.annotation.gtf.gz"))
+
+txdb <- txdbmaker::makeTxDbFromGFF(gtf, format = "gtf")
+# GENCODE v43 has ~252k transcripts; far fewer means the GTF download was cut short
+length(AnnotationDbi::keys(txdb, "TXNAME"))
+# save to not rebuild every time
+AnnotationDbi::saveDb(txdb, here("workflows/data/gencode.v43.sqlite"))
+```
+
+## Build the SummarizedExperiment
+
+One `SummarizedExperiment` with the 12 samples of both series, imported with
+tximeta. The sample table is parsed from the file names,
+`<GSM>_<group>_<replicate>_quant.sf.txt.gz`.
+
+```{r make_se, eval=FALSE}
+txdb <- AnnotationDbi::loadDb(here("workflows/data/gencode.v43.sqlite"))
+tx2gene <- AnnotationDbi::select(txdb, keys(txdb, "TXNAME"), "GENEID", "TXNAME")
+
+coldata <- data.frame(
+  files = list.files(here("workflows/data/PCBP1"),
+                     pattern = "_quant\\.sf\\.txt\\.gz$",
+                     recursive = TRUE, full.names = TRUE)
+) |>
+  dplyr::mutate(
+    series = basename(dirname(files)),
+    geo_accession = sub("_.*", "", basename(files)),
+    group = sub("^GSM[0-9]+_(.+)_[0-9]+_quant.*", "\\1", basename(files)),
+    replicate = sub(".*_([0-9]+)_quant.*", "\\1", basename(files)),
+    names = paste(group, replicate, sep = "_"),
+    experiment = dplyr::case_when(
+      series == "GSE279951" ~ "PCBP1_KD",
+      series == "GSE279949" ~ "chelator"
+    ),
+    condition = dplyr::case_when(
+      group == "shCtrl" ~ "WT",
+      group == "shPCBP1" ~ "KD",
+      group == "DMSO" ~ "DMSO",
+      group == "CHEL" ~ "CHEL"
+    )
+  )
+coldata
+
+# check how many transcripts in the quant files are in txdb (should be 1;
+# tximeta below fails if any are missing)
+read.delim(coldata$files[1])$Name %in% tx2gene$TXNAME |> mean()
+
+# tximeta matches the index hash in aux_info/meta_info.json to GENCODE v43, then
+# looks in its BiocFileCache for a TxDb named after the v43 GTF: register the
+# TxDb built above under that name, so tximeta loads it instead of downloading
+# and building its own
+bfc <- BiocFileCache::BiocFileCache(tximeta:::getBFCLoc(), ask = FALSE)
+in_cache <- BiocFileCache::bfcquery(
+  bfc, "gencode.v43.annotation.gtf.gz", field = "rname", exact = TRUE
+)
+if (nrow(in_cache) == 0) {
+  BiocFileCache::bfcadd(
+    bfc, rname = "gencode.v43.annotation.gtf.gz",
+    fpath = here("workflows/data/gencode.v43.sqlite"), action = "asis"
+  )
+}
+
+# transcript-level counts; dtuScaledTPM scales TPM by the median transcript
+# length of each gene, the tximport setting recommended for DTU
+se <- tximeta::tximeta(
+  coldata, countsFromAbundance = "dtuScaledTPM", tx2gene = tx2gene
+)
+
+se
+
+saveRDS(se, here("workflows/data/PCBP1/PCBP1_SummarizedExperiment.rds"))
+```
+
+```{r setup, message=FALSE}
+se <- readRDS(here("workflows/data/PCBP1/PCBP1_SummarizedExperiment.rds"))
+dim(se)
+colData(se)
+```
+
+## DTU testing with satuRn: PCBP1 knockdown (GSE279951)
+
+We compare control shRNA (`WT`) against PCBP1 knockdown (`KD`) using satuRn.
+GEO gives no pairing between the replicates of the two conditions, so there is
+no blocking term (unlike `donor` in the RBP workflow).
+
+```{r filter_kd}
+se_kd <- se[, se$experiment == "PCBP1_KD"]
+dim(se_kd)
+
+# counts >= 10 in at least 3 samples (the size of one group)
+keep <- rowSums(assay(se_kd) >= 10) >= 3
+se_kd <- se_kd[keep, ]
+dim(se_kd)
+```
+
+```{r dtu_design_kd}
+# KD as reference level
+colData(se_kd)$condition <- factor(colData(se_kd)$condition, levels = c("KD", "WT"))
+
+# build design from the factor directly (matches satuRn vignette convention)
+condition <- colData(se_kd)$condition
+design <- model.matrix(~ 0 + condition)
+
+L <- limma::makeContrasts(
+  WT_vs_KD = conditionWT - conditionKD,
+  levels = design
+)
+L
+```
+
+```{r dtu_fit_kd, message=FALSE}
+rowData(se_kd)$isoform_id <- rowData(se_kd)$tx_name
+# flatten CharacterList gene_id to plain character
+rowData(se_kd)$gene_id <- vapply(rowData(se_kd)$gene_id, `[`, character(1), 1)
+
+se_kd <- se_kd[
+  duplicated(rowData(se_kd)$gene_id) |
+    duplicated(rowData(se_kd)$gene_id, fromLast = TRUE),
+]
+dim(se_kd)
+se_kd <- satuRn::fitDTU(se_kd, formula = ~0 + condition)
+```
+
+```{r dtu_test_kd, message=FALSE}
+se_kd <- satuRn::testDTU(
+  object = se_kd,
+  contrasts = L,
+  diagplot1 = TRUE,
+  diagplot2 = TRUE
+)
+```
+
+```{r dtu_results_kd}
+gene_ids <- rowData(se_kd)$gene_id
+
+# every tested transcript; `sig_res_kd` below is the significant subset, and the
+# non-significant rows are the background pool for slSampleNonEventExons()
+dtu_res_kd <- rowData(se_kd)[["fitDTUResult_WT_vs_KD"]] |>
+  as.data.frame() |>
+  tibble::rownames_to_column("tx_name") |>
+  tibble::as_tibble() |>
+  dplyr::mutate(gene_id = gene_ids) |>
+  dplyr::select(tx_name, gene_id, estimates, pval, regular_FDR) |>
+  dplyr::arrange(pval)
+
+sig_res_kd <- dtu_res_kd |> dplyr::filter(regular_FDR < 0.1)
+
+sig_res_kd <- sig_res_kd |> mutate(tx_id = tx_name)
+sig_res_kd
+# save for later use
+saveRDS(dtu_res_kd, here("workflows/data/PCBP1/dtu_res_kd.rds"))
+saveRDS(sig_res_kd, here("workflows/data/PCBP1/sig_res_kd.rds"))
+```
+
+
+
+## DTU testing with satuRn: iron chelation (GSE279949)
+
+Same steps, comparing DMSO (`DMSO`) against the iron chelator (`CHEL`).
+
+```{r filter_chel}
+se_chel <- se[, se$experiment == "chelator"]
+dim(se_chel)
+
+# counts >= 10 in at least 3 samples (the size of one group)
+keep <- rowSums(assay(se_chel) >= 10) >= 3
+se_chel <- se_chel[keep, ]
+dim(se_chel)
+```
+
+```{r dtu_design_chel}
+# CHEL as reference level
+colData(se_chel)$condition <- factor(colData(se_chel)$condition, levels = c("CHEL", "DMSO"))
+
+# build design from the factor directly (matches satuRn vignette convention)
+condition <- colData(se_chel)$condition
+design <- model.matrix(~ 0 + condition)
+
+L <- limma::makeContrasts(
+  DMSO_vs_CHEL = conditionDMSO - conditionCHEL,
+  levels = design
+)
+L
+```
+
+```{r dtu_fit_chel, message=FALSE}
+rowData(se_chel)$isoform_id <- rowData(se_chel)$tx_name
+# flatten CharacterList gene_id to plain character
+rowData(se_chel)$gene_id <- vapply(rowData(se_chel)$gene_id, `[`, character(1), 1)
+
+se_chel <- se_chel[
+  duplicated(rowData(se_chel)$gene_id) |
+    duplicated(rowData(se_chel)$gene_id, fromLast = TRUE),
+]
+dim(se_chel)
+se_chel <- satuRn::fitDTU(se_chel, formula = ~0 + condition)
+```
+
+```{r dtu_test_chel, message=FALSE}
+se_chel <- satuRn::testDTU(
+  object = se_chel,
+  contrasts = L,
+  diagplot1 = TRUE,
+  diagplot2 = TRUE
+)
+```
+
+```{r dtu_results_chel}
+gene_ids <- rowData(se_chel)$gene_id
+
+dtu_res_chel <- rowData(se_chel)[["fitDTUResult_DMSO_vs_CHEL"]] |>
+  as.data.frame() |>
+  tibble::rownames_to_column("tx_name") |>
+  tibble::as_tibble() |>
+  dplyr::mutate(gene_id = gene_ids) |>
+  dplyr::select(tx_name, gene_id, estimates, pval, regular_FDR) |>
+  dplyr::arrange(pval)
+
+sig_res_chel <- dtu_res_chel |> dplyr::filter(regular_FDR < 0.3)
+
+sig_res_chel <- sig_res_chel |> mutate(tx_id = tx_name)
+sig_res_chel
+# save for later use
+saveRDS(dtu_res_chel, here("workflows/data/PCBP1/dtu_res_chel.rds"))
+saveRDS(sig_res_chel, here("workflows/data/PCBP1/sig_res_chel.rds"))
+```
+
+```{r load_sig_res}
+# load the saved DTU results
+sig_res_kd <- readRDS(here("workflows/data/PCBP1/sig_res_kd.rds"))
+exsig_res_chel <- readRDS(here("workflows/data/PCBP1/sig_res_chel.rds"))
+sig_res_kd
+sig_res_chel
+```
+
+## Splice event detection with splicelogic for PCBP1 knockdown
+
+We run event detection on the PCBP1 knockdown comparison (`sig_res_kd`); the same
+steps apply to the chelator comparison by swapping in `sig_res_chel`.
+
+### Direction of the events
+
+WT (PCBP1 present) is the up side and KD (no PCBP1) the reference. The contrast
+is `WT_vs_KD = conditionWT - conditionKD`, so a positive estimate means the
+transcript is used more in WT. splicelogic treats the down transcripts as the
+reference, so every event describes what WT transcripts do compared with KD
+ones, as in the RBP workflow. With `~ 0 + condition` there is no intercept, so
+the level order (`levels = c("KD", "WT")`) does not change the fit: the
+contrast alone sets the direction.
+
+| Event | What happens | What it suggests about PCBP1 |
+|---|---|---|
+| IE | Exon is in WT transcripts and lost after KD | PCBP1 promotes inclusion |
+| SE | Exon is skipped in WT transcripts and gained after KD | PCBP1 represses inclusion (promotes skipping) |
+
+PCBP1 binding upstream of an exon typically promotes its inclusion, and
+knockdown lowers it, so that pattern shows up as IE events.
+SE events are kept as the context-dependent group, and the two sets are
+compared in the sequence-context analysis below.
+
+The source paper ("Iron-sensitive RNA regulation by poly C binding proteins",
+PMID 41036621) reports the same direction with rMATS: after PCBP1 knockdown,
+4177 cassette exons were skipped and 2218 included (Fig. 2K), and PCBP1
+overexpression shifted the balance the other way (1233 skipped, 2126 included;
+Fig. 2M), so PCBP1 primarily promotes exon inclusion. They read the direction
+from the KD side and we read it from the WT side, so their exons skipped after
+KD are our IE events and their exons included after KD are our SE events. If
+our results agree, IE events should outnumber SE events.
+
+```{r make_exons, eval=FALSE}
+# build exon GRangesList and rename from internal TXID to TXNAME
+txdb <- AnnotationDbi::loadDb(here("workflows/data/gencode.v43.sqlite"))
+exons <- exonsBy(txdb, by = "tx")
+txps <- AnnotationDbi::select(txdb, keys(txdb, "TXID"), c("TXNAME", "GENEID"), "TXID") |>
+  tibble::as_tibble() |>
+  dplyr::mutate(TXID = as.character(TXID))
+# rename exons to match tx_name in se, matching by TXID
+all.equal(names(exons), txps$TXID)
+names(exons) <- txps$TXNAME[match(names(exons), txps$TXID)]
+saveRDS(exons, here("workflows/data/PCBP1/gencode.v43.exons.rds"))
+```
+
+```{r input_formatting}
+# load from saved sqlite
+txdb <- AnnotationDbi::loadDb(here("workflows/data/gencode.v43.sqlite"))
+# load exons from saved rds
+exons <- readRDS(here("workflows/data/PCBP1/gencode.v43.exons.rds"))
+```
+
+```{r preprare_exons}
+# prepare exons for splicelogic
+sig_exons <- prepare_exons(
+  txdb, sig_res_kd, coef_col = "estimates", verbose = TRUE
+)
+```
+
+```{r find_events}
+#find se
+se_events <- sig_exons |> preprocess(coef_col = "estimates")|> find_se()
+
+#find all events
+events <- sig_exons |> preprocess(coef_col = "estimates")|> find_all_events()
+```
+
+```{r collapse_redundant_events}
+# define a helper function
+my_paste <- \(x) paste(unique(x), collapse = ",")
+collapsed_events <- events |>
+    dplyr::group_by(exon_id, event_type) |>
+    plyranges::reduce_ranges_directed(
+        n = plyranges::n(),
+        tx_id = my_paste(tx_id),
+        exon_rank = my_paste(exon_rank),
+        event_tx_id = my_paste(event_tx_id),
+  )
+```
+
+```{r barplot_event_types}
+event_counts <- events |>
+    as_tibble() |>
+    dplyr::group_by(event_type) |>
+    dplyr::summarise(count = dplyr::n())
+
+collapsed_event_counts <- collapsed_events |>
+    as_tibble() |>
+    dplyr::group_by(event_type) |>
+    dplyr::summarise(count = dplyr::n())
+
+# combine both count tables into one, labelled by source
+counts <- dplyr::bind_rows(
+  "All events" = event_counts,
+  "Collapsed events" = collapsed_event_counts,
+  .id = "set"
+)
+
+ggplot(counts, aes(x = event_type, y = count, fill = set)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  scale_fill_manual(values = c(
+    "All events" = "#9ecae1",       # light blue
+    "Collapsed events" = "#3182bd"  # darker blue
+  )) +
+  labs(title = "Splice event counts",
+  x = "Event Type", y = "Count", fill = NULL) +
+  theme_bw()
+```
+
+```{r plot_events_by_gene}
+# use splicelogic's built-in plotting function to visualize events for a specific gene
+gene_of_interest <- events$gene_id[1]
+# filter events for the gene of interest
+events_for_gene <- events[events$gene_id == gene_of_interest]
+
+# visualize the events for the gene of interest
+splicelogic::plot_transcripts(events_for_gene, sig_exons, rescale_introns = FALSE) +
+  ggtitle(paste("Splice events for gene:", gene_of_interest))
+```
+
+```{r save_events_plots, eval=FALSE}
+# make a plot for each gene with events and save to files
+# plot_transcripts_by_gene returns a list of ggplot objects, one for each gene
+plots <- plot_transcripts_by_gene(events, sig_exons)
+# save each plot to the same pdf file
+pdf(here("workflows/figures/PCBP1_splice_events_by_gene.pdf"), width = 8, height = 6)
+for (gene in names(plots)) {
+    print(plots[[gene]])
+}
+dev.off()
+```
+
+## Sequence context around the event exons, focusing on included exons (IE)
+
+IE exons are the main set here (see *Direction of the events* above); SE exons
+are kept below as a comparison.
+
+The analysis below uses a set of sequence-context helpers consolidated in
+`helper.R` (nucleotide-composition profiles, background exon sampling,
+splice-site logos and RBP motif scanning). The splicelogic package itself only
+exports `get_seq()` for sequence work, so these stay as paper-repo helpers (for now).
+
+```{r seq_context_helpers, message=FALSE}
+source(here("workflows/helper.R"))
+```
+
+`slEventFlankProfiles()` takes a finder's output straight away: it flanks each
+exon (strand-aware, so "upstream" is 5' in transcription order), slides
+overlapping windows across the flank, and returns the per-window nucleotide
+fractions for each side.
+
+```{r flank_windows_ie, message=FALSE}
+ie_events <- sig_exons |> preprocess(coef_col = "estimates") |> find_ie()
+
+ie_profiles <- slEventFlankProfiles(ie_events, genome = "hg38", width = 100)
+
+# rows = events, cols = window_nucleotide (e.g. w1_A)
+dim(ie_profiles$upstream)
+dim(ie_profiles$downstream)
+```
+
+```{r plot_updownstream_ie, fig.width=8, fig.height=3.5}
+slPlotFlankProfiles(ie_profiles, exon_label = "IE")
+```
+
+### skipped exons events
+
+```{r flank_windows_se, message=FALSE}
+se_profiles <- slEventFlankProfiles(se_events, genome = "hg38", width = 100)
+
+# rows = events, cols = window_nucleotide (e.g. w1_A)
+dim(se_profiles$upstream)
+dim(se_profiles$downstream)
+```
+
+```{r plot_updownstream_se, fig.width=8, fig.height=3.5}
+slPlotFlankProfiles(se_profiles, exon_label = "SE")
+```
+
+
+## Background set
+
+We want to compare the sequence context of the events with that of a control set.
+For the control set (non-event exons), we sample as many exons as there are events,
+drawn at random from the internal exons of transcripts with no evidence of
+differential usage (`pval > 0.5`).
+
+```{r non_event_exons}
+dtu_res_kd <- readRDS(here("workflows/data/PCBP1/dtu_res_kd.rds"))
+non_event <- slSampleNonEventExons(
+  dtu_res_kd, exons, n = ie_events, pval_min = 0.5, seed = 1
+)
+non_event
+```
+
+```{r flank_windows_non_event, message=FALSE, fig.width=8, fig.height=3.5}
+non_event_profiles <- slEventFlankProfiles(
+  non_event, genome = "hg38", width = 100
+)
+dim(non_event_profiles$upstream)
+
+slPlotFlankProfiles(non_event_profiles, exon_label = "non-IE")
+```
+
+An alternative, within-transcript control: for each event, the internal exon of
+the same transcript that is shared with the event partner and closest in rank
+to the event exon.
+
+```{r matched_non_event_exons, eval=FALSE, fig.width=8, fig.height=3.5}
+matched <- slMatchedNonEventExons(ie_events, exons)
+
+slEventFlankProfiles(matched, genome = "hg38", width = 100) |>
+  slPlotFlankProfiles(exon_label = "matched exon")
+```
+
+## Splice-site sequence logos
+
+The window profiles above average over 10 bp, which smooths the splice site
+away. `slFlankLogoMatrices()` keeps every base position separate and returns a
+position frequency matrix per side, running `width` bases into the intron and
+`exon_bases` into the exon so the boundary is inside the matrix.
+
+Note which site each side carries: the region **upstream** of an exon is the
+end of the preceding intron and holds the **3' splice site** (acceptor,
+`...ag | EXON`); the region **downstream** is the start of the following intron
+and holds the **5' splice site** (donor, `EXON | gu...`).
+
+```{r logo_events, message=FALSE, warning=FALSE, fig.width=13, fig.height=3.2}
+ie_logo <- slFlankLogoMatrices(ie_events, genome = "hg38",
+                               width = 25, exon_bases = 3)
+
+# letter height = frequency at that position
+slPlotFlankLogo(ie_logo, method = "prob")
+```
+
+```{r logo_events_bits, message=FALSE, warning=FALSE, fig.width=13, fig.height=3.2}
+# letter height = information content, the classic logo scaling: unconstrained
+# positions shrink to nothing and the consensus stands out
+slPlotFlankLogo(ie_logo, method = "bits")
+```
+
+The same for the background set, to see whether the event splice sites differ
+from those of exons in transcripts with no differential usage.
+
+```{r logo_non_event, message=FALSE, warning=FALSE, fig.width=13, fig.height=3.2}
+non_event_logo <- slFlankLogoMatrices(non_event, genome = "hg38",
+                                      width = 25, exon_bases = 3)
+
+slPlotFlankLogo(non_event_logo, method = "bits")
+```
+
+```{r logo_difference}
+# where the two sets differ most, per position and nucleotide; upstream holds
+# the 3' splice site, where a C-rich tract preceding the exon would sit
+delta_up <- ie_logo$upstream - non_event_logo$upstream
+round(delta_up[, order(-apply(abs(delta_up), 2, max))[1:6]], 3)
+
+delta_down <- ie_logo$downstream - non_event_logo$downstream
+round(delta_down[, order(-apply(abs(delta_down), 2, max))[1:6]], 3)
+```
