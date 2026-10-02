@@ -10,4 +10,5 @@ validation/biosurfer/gencode.v42.*
 validation/biosurfer/.DS_Store
 workflows/figures/*
 workflows/data/*
+workflows/sandbox/*
 .DS_Store
