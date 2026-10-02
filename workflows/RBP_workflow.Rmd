@@ -232,3 +232,125 @@ for (gene in names(plots)) {
 }
 dev.off()
 ```
+
+## Sequence context around the event exons, focusing on skipped exons (SE) and included exons (IE)
+
+The analysis below uses a set of sequence-context helpers consolidated in
+`helper.R` (nucleotide-composition profiles, background exon sampling,
+splice-site logos and RBP motif scanning). The splicelogic package itself only
+exports `get_seq()` for sequence work, so these stay as paper-repo helpers (for now).
+
+```{r seq_context_helpers, message=FALSE}
+source(here("workflows/helper.R"))
+```
+
+`slEventFlankProfiles()` takes a finder's output straight away: it flanks each
+exon (strand-aware, so "upstream" is 5' in transcription order), slides
+overlapping windows across the flank, and returns the per-window nucleotide
+fractions for each side.
+
+```{r flank_windows_events, message=FALSE}
+se_profiles <- slEventFlankProfiles(se_events, genome = "hg38", width = 100)
+
+# rows = events, cols = window_nucleotide (e.g. w1_A)
+dim(se_profiles$upstream)
+dim(se_profiles$downstream)
+```
+
+```{r plot_updownstream_events, fig.width=8, fig.height=3.5}
+slPlotFlankProfiles(se_profiles, exon_label = "SE")
+```
+
+### included exons events
+
+```{r flank_windows_ie, message=FALSE}
+
+ie_events <- sig_exons |> preprocess(coef_col = "estimates")|> find_ie()
+
+ie_profiles <- slEventFlankProfiles(ie_events, genome = "hg38", width = 100)
+
+# rows = events, cols = window_nucleotide (e.g. w1_A)
+dim(ie_profiles$upstream)
+dim(ie_profiles$downstream)
+```
+
+```{r plot_updownstream_ie, fig.width=8, fig.height=3.5}
+slPlotFlankProfiles(ie_profiles, exon_label = "IE")
+```
+
+
+## Background set
+
+We want to compare the sequence context of the events with that of a control set.
+For the control set (non-event exons), we sample as many exons as there are events, 
+drawn at random from the internal exons of transcripts with no evidence of 
+differential usage (`pval > 0.5`).
+
+```{r non_event_exons}
+non_event <- slSampleNonEventExons(
+  dtu_res, exons, n = se_events, pval_min = 0.5, seed = 1
+)
+non_event
+```
+
+```{r flank_windows_non_event, message=FALSE, fig.width=8, fig.height=3.5}
+non_event_profiles <- slEventFlankProfiles(
+  non_event, genome = "hg38", width = 100
+)
+dim(non_event_profiles$upstream)
+
+slPlotFlankProfiles(non_event_profiles, exon_label = "non-SE")
+```
+
+An alternative, within-transcript control: for each event, the internal exon of
+the same transcript that is shared with the event partner and closest in rank
+to the event exon.
+
+```{r matched_non_event_exons, eval=FALSE, fig.width=8, fig.height=3.5}
+matched <- slMatchedNonEventExons(se_events, exons)
+
+slEventFlankProfiles(matched, genome = "hg38", width = 100) |>
+  slPlotFlankProfiles(exon_label = "matched exon")
+```
+
+## Splice-site sequence logos
+
+The window profiles above average over 10 bp, which smooths the splice site
+away. `slFlankLogoMatrices()` keeps every base position separate and returns a
+position frequency matrix per side, running `width` bases into the intron and
+`exon_bases` into the exon so the boundary is inside the matrix.
+
+Note which site each side carries: the region **upstream** of an exon is the
+end of the preceding intron and holds the **3' splice site** (acceptor,
+`...ag | EXON`); the region **downstream** is the start of the following intron
+and holds the **5' splice site** (donor, `EXON | gu...`).
+
+```{r logo_events, message=FALSE, warning=FALSE, fig.width=13, fig.height=3.2}
+se_logo <- slFlankLogoMatrices(se_events, genome = "hg38",
+                               width = 25, exon_bases = 3)
+
+# letter height = frequency at that position
+slPlotFlankLogo(se_logo, method = "prob")
+```
+
+```{r logo_events_bits, message=FALSE, warning=FALSE, fig.width=13, fig.height=3.2}
+# letter height = information content, the classic logo scaling: unconstrained
+# positions shrink to nothing and the consensus stands out
+slPlotFlankLogo(se_logo, method = "bits")
+```
+
+The same for the background set, to see whether the event splice sites differ
+from those of exons in transcripts with no differential usage.
+
+```{r logo_non_event, message=FALSE, warning=FALSE, fig.width=13, fig.height=3.2}
+non_event_logo <- slFlankLogoMatrices(non_event, genome = "hg38",
+                                      width = 25, exon_bases = 3)
+
+slPlotFlankLogo(non_event_logo, method = "prob")
+```
+
+```{r logo_difference}
+# where the two sets differ most, per position and nucleotide
+delta <- se_logo$downstream - non_event_logo$downstream
+round(delta[, order(-apply(abs(delta), 2, max))[1:6]], 3)
+```
