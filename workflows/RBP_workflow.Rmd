@@ -1,0 +1,234 @@
+---
+title: "RBP workflow"
+output: html_document
+---
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(splicelogic)
+library(SummarizedExperiment)
+library(GenomicFeatures)
+library(dplyr)
+library(ggplot2)
+library(satuRn)
+library(limma)
+library(tibble)
+library(here)
+devtools::load_all(here("../splicelogic"))
+```
+
+```{r setup, message=FALSE}
+# dir <- system.file("extdata", package = "splicelogic")
+# se <- readRDS(file.path(dir, "GTEx_v9_ONT_SummarizedExperiment.rds"))
+se <- readRDS(here("workflows/data/GTEx_v9_ONT_SummarizedExperiment.rds"))
+dim(se)
+
+keep <- rowSums(assay(se) >= 10) >= 6
+se <- se[keep, ]
+dim(se)
+# filters: 385669 -> 18985 transcripts
+```
+
+```{r cpm}
+library(DESeq2)
+library(tximeta)
+colsums <- colSums(assay(se, "counts"))
+cpm <- t(t(assay(se, "counts")) / colsums * 1e6)
+assay(se, "abundance") <- cpm
+# dummy lengths... no correction for length
+assay(se, "length", withDimnames=FALSE) <- matrix(1000, nrow=nrow(se), ncol=ncol(se))
+```
+
+## DTU testing with satuRn
+
+We compare the experiment condition (`exp`, RBP knockdown) against
+control (`ctrl`) using satuRn.
+
+```{r dtu_design}
+colData(se)$condition <- dplyr::case_when(
+    colData(se)$condition == "ctrl" ~ "WT",
+    colData(se)$condition == "exp" ~ "KD"
+)
+# KD as reference level
+colData(se)$condition <- factor(colData(se)$condition, levels = c("KD", "WT"))
+
+# build design from the factor directly (matches satuRn vignette convention)
+condition <- colData(se)$condition
+donor <- factor(colData(se)$donor)
+design <- model.matrix(~ 0 + condition + donor)
+
+L <- limma::makeContrasts(
+  WT_vs_KD = conditionWT - conditionKD,
+  levels = design
+)
+L
+```
+
+```{r dtu_fit, message=FALSE}
+rowData(se)$isoform_id <- rowData(se)$tx_name
+# flatten CharacterList gene_id to plain character
+rowData(se)$gene_id <- vapply(rowData(se)$gene_id, `[`, character(1), 1)
+
+se <- se[
+  duplicated(rowData(se)$gene_id) |
+    duplicated(rowData(se)$gene_id, fromLast = TRUE),
+]
+# 18985 transcripts -> 11874 transcripts after removing single-isoform genes
+se <- satuRn::fitDTU(se, formula = ~0 + condition + donor)
+```
+
+```{r dtu_test, message=FALSE}
+se <- satuRn::testDTU(
+  object = se,
+  contrasts = L,
+  diagplot1 = TRUE,
+  diagplot2 = TRUE
+)
+```
+
+```{r dtu_results}
+gene_ids <- rowData(se)$gene_id
+
+# every tested transcript; `sig_res` below is the significant subset, and the
+# non-significant rows are the background pool for slSampleNonEventExons()
+dtu_res <- rowData(se)[["fitDTUResult_WT_vs_KD"]] |>
+  as.data.frame() |>
+  tibble::rownames_to_column("tx_name") |>
+  tibble::as_tibble() |>
+  dplyr::mutate(gene_id = gene_ids) |>
+  dplyr::select(tx_name, gene_id, estimates, pval, regular_FDR) |>
+  dplyr::arrange(pval)
+
+sig_res <- dtu_res |> dplyr::filter(regular_FDR < 0.3)
+
+sig_res <- sig_res |> mutate( tx_id = tx_name)
+sig_res
+# save sig_res for later use
+saveRDS(sig_res, here("workflows/data/sig_res.rds"))
+```
+
+```{r load_sig_res}
+# load the saved DTU results
+sig_res <- readRDS(here("workflows/data/sig_res.rds"))
+sig_res
+```
+
+```{r txdb, eval=FALSE}
+library(txdbmaker)
+# load TxDb for GRanges conversion
+# download once (warning: ~50MB compressed)
+wget https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_48/gencode.v48.annotation.gtf.gz
+
+txdb <- txdbmaker::makeTxDbFromGFF(
+  "/Users/beacm/Documents/splicelogic-paper/workflows/gencode.v48.annotation.gtf.gz",
+  format = "gtf"
+)
+# save to not rebuild every time
+AnnotationDbi::saveDb(txdb, here("workflows/data/gencode.v48.sqlite"))
+
+# check how many transcripts in se are in txdb
+rowData(se)$tx_name %in% AnnotationDbi::keys(txdb, "TXNAME") |> sum() / length(rowData(se)$tx_name)
+```
+## Splice event detection with splicelogic
+
+```{r make_exons, eval=FALSE}
+# build exon GRangesList and rename from internal TXID to TXNAME
+txdb <- AnnotationDbi::loadDb(here("workflows/data/gencode.v48.sqlite"))
+exons <- exonsBy(txdb, by = "tx")
+txps <- AnnotationDbi::select(txdb, keys(txdb, "TXID"), c("TXNAME", "GENEID"), "TXID") |>
+  tibble::as_tibble() |>
+  dplyr::mutate(TXID = as.character(TXID))
+# rename exons to match tx_name in se, matching by TXID
+all.equal(names(exons), txps$TXID)
+names(exons) <- txps$TXNAME[match(names(exons), txps$TXID)]
+saveRDS(exons, here("workflows/data/glinos_exons.rds"))
+```
+
+```{r input_formatting}
+# load from saved sqlite
+txdb <- AnnotationDbi::loadDb(here("workflows/data/gencode.v48.sqlite"))
+# load exons from saved rds
+exons <- readRDS(here("workflows/data/glinos_exons.rds"))
+```
+
+```{r preprare_exons}
+# prepare exons for splicelogic
+sig_exons <-  prepare_exons(
+  txdb, sig_res, coef_col = "estimates", verbose = TRUE
+)
+```
+
+```{r find_events}
+#find se
+se_events <- sig_exons |> preprocess(coef_col = "estimates")|> find_se()
+
+#find all events
+events <- sig_exons |> preprocess(coef_col = "estimates")|> find_all_events()
+```
+
+
+```{r collapse_redundant_events}
+# define a helper function
+my_paste <- \(x) paste(unique(x), collapse = ",")
+collapsed_events <- events |>
+    dplyr::group_by(exon_id, event_type) |>
+    plyranges::reduce_ranges_directed(
+        n = plyranges::n(),
+        tx_id = my_paste(tx_id),
+        exon_rank = my_paste(exon_rank),
+        event_tx_id = my_paste(event_tx_id),
+  )
+```
+
+```{r barplot_event_types}
+event_counts <- events |>
+    as_tibble() |>
+    dplyr::group_by(event_type) |>
+    dplyr::summarise(count = dplyr::n())
+
+collapsed_event_counts <- collapsed_events |>
+    as_tibble() |>
+    dplyr::group_by(event_type) |>
+    dplyr::summarise(count = dplyr::n())
+
+# combine both count tables into one, labelled by source
+counts <- dplyr::bind_rows(
+  "All events" = event_counts,
+  "Collapsed events" = collapsed_event_counts,
+  .id = "set"
+)
+
+ggplot(counts, aes(x = event_type, y = count, fill = set)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  scale_fill_manual(values = c(
+    "All events" = "#9ecae1",       # light blue
+    "Collapsed events" = "#3182bd"  # darker blue
+  )) +
+  labs(title = "Splice event counts", 
+  x = "Event Type", y = "Count", fill = NULL) +
+  theme_bw()
+```
+
+```{r plot_events_by_gene}
+# use splicelogic's built-in plotting function to visualize events for a specific gene
+# for example, let's visualize events for the gene "ENSG00000187634.13"
+gene_of_interest <- "ENSG00000196924.19"
+# filter events for the gene of interest
+events_for_gene <- events[events$gene_id == gene_of_interest]
+
+# visualize the events for the gene of interest
+splicelogic::plot_transcripts(events_for_gene, sig_exons, rescale_introns = FALSE) +
+  ggtitle(paste("Splice events for gene:", gene_of_interest))
+ 
+```
+
+```{r save_events_plots, eval=FALSE}
+# make a plot for each gene with events and save to files
+# plot_transcripts_by_gene returns a list of ggplot objects, one for each gene
+plots <- plot_transcripts_by_gene(events, sig_exons)
+# save each plot to the same pdf file - takes a while: -- 1725 genes 
+pdf(here("workflows/figures/splice_events_by_gene.pdf"), width = 8, height = 6)
+for (gene in names(plots)) {
+    print(plots[[gene]])
+}
+dev.off()
+```

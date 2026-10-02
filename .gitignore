@@ -7,3 +7,7 @@ validation/biosurfer/biosurfer.txt
 validation/biosurfer/gencode.v42.*
 *.rds
 *.tar.gz
+validation/biosurfer/.DS_Store
+workflows/figures/*
+workflows/data/*
+.DS_Store
