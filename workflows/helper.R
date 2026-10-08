@@ -175,6 +175,8 @@ slEventFlankProfiles <- function(events, genome, width = 100,
 #'   window starts. Taken from the attributes of `profiles` when available.
 #' @param gap Width of the exon box, in window units.
 #' @param ylim y-axis range (the panel is clipped to it, means use every window).
+#' @param hlines y values of horizontal reference lines, also used as the
+#'   y-axis breaks. `NULL` for none.
 #' @param palette Named colour vector for the four nucleotides.
 #' @return A `ggplot` object.
 slPlotFlankProfiles <- function(profiles, downstream = NULL,
@@ -183,6 +185,7 @@ slPlotFlankProfiles <- function(profiles, downstream = NULL,
                                 step    = NULL,
                                 gap     = 8,
                                 ylim    = c(0, 0.7),
+                                hlines  = seq(ylim[1], ylim[2], by = 0.1),
                                 palette = c(A = "#F84040", C = "skyblue",
                                             G = "#FFB400", U = "#06D6A0")) {
 
@@ -237,6 +240,11 @@ slPlotFlankProfiles <- function(profiles, downstream = NULL,
         x = .data$x, y = .data$value, color = .data$nt,
         group = interaction(.data$set, .data$nt)
     )) +
+        # drawn first so the exon box and the profiles sit on top
+        (if (length(hlines) > 0L) {
+            ggplot2::geom_hline(yintercept = hlines, colour = "grey85",
+                                linewidth = 0.3)
+        }) +
         ggplot2::annotate("rect",
                           xmin = xmin, xmax = xmax,
                           ymin = ymid - yoff, ymax = ymid + yoff,
@@ -250,7 +258,10 @@ slPlotFlankProfiles <- function(profiles, downstream = NULL,
                               width = 0.2) +
         ggplot2::scale_color_manual(values = palette) +
         ggplot2::scale_x_continuous(breaks = breaks, labels = labels) +
-        ggplot2::scale_y_continuous(expand = c(0, 0)) +
+        ggplot2::scale_y_continuous(
+            breaks = if (length(hlines) > 0L) hlines else ggplot2::waiver(),
+            expand = c(0, 0)
+        ) +
         # clipped rather than filtered, so the means use every window
         ggplot2::coord_cartesian(ylim = ylim) +
         ggplot2::labs(x = "Relative location (bp)",
