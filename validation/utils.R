@@ -7,7 +7,9 @@ make_cds_gr <- function(tx_names, txps, grl) {
     gr <- grl[[as.character(txid)]]
     if (is.null(gr)) next
     mcols(gr)$tx_id <- tx_name
-    mcols(gr)$gene_id <- sub("-\\d+$", "", tx_name)
+    # Ensembl gene_id, not parsed from tx_name: unnamed transcripts are
+    # named by their ENST id, which would give each its own gene
+    mcols(gr)$gene_id <- txps$gene_id[txps$transcript_name == tx_name][1]
     exon_list[[i]] <- gr
   }
   bind_ranges(exon_list)

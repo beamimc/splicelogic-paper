@@ -32,7 +32,9 @@ if (file.exists(txps_rds) && file.exists(cbt_rds) & file.exists(ebt_rds)) {
 } else {
   library(GenomicFeatures)
   txdb <- AnnotationDbi::loadDb(db_path)
-  txps <- GenomicFeatures::transcripts(txdb)
+  txps <- GenomicFeatures::transcripts(txdb, columns = c("tx_id", "tx_name", "gene_id"))
+  # one gene per transcript in GENCODE; flatten the CharacterList
+  txps$gene_id <- unlist(txps$gene_id)
   # transcript_name (e.g. "DDX11L2-202") is not stored in TxDb; recover from GTF
   gtf_gr <- rtracklayer::import(gtf, feature.type = "transcript")
   tx_name_map <- setNames(gtf_gr$transcript_name, gtf_gr$transcript_id)
