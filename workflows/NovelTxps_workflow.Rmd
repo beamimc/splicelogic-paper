@@ -1,0 +1,442 @@
+---
+title: "Novel Transcripts Workflow"
+output: html_document
+---
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(splicelogic)
+library(SummarizedExperiment)
+library(GenomicFeatures)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(here)
+library(plyxp)
+devtools::load_all(here("../splicelogic"))
+```
+
+## Load bambu output
+
+`bambu_discovery.rds` is the exon-by-transcript `GRangesList` from bambu's
+discovery run (novel plus annotated transcripts); `bambu_quant_se.rds` is the
+matching quantification `SummarizedExperiment`.
+
+```{r setup_bambu, message=FALSE}
+bdisc    <- readRDS(here("workflows", "data", "bambu_discovery.rds"))
+se_bambu <- readRDS(here("workflows", "data", "bambu_quant_se.rds"))
+bdisc
+```
+
+## Transcript annotation (condition, CPM, direction)
+
+Condition and donor live only in the sample names; `ctrl` -> WT and `exp` -> KD
+to match the satuRn workflow. For each transcript we take the mean CPM in each
+group and the `log2(WT / KD)` fold change, whose sign gives the direction.
+
+```{r condition_cpm}
+cn <- colnames(se_bambu)
+colData(se_bambu)$condition <- factor(
+  ifelse(grepl("_ctrl", cn), "WT", "KD"), levels = c("KD", "WT")
+)
+colData(se_bambu)$donor <- sub("-0008.*$", "", cn)
+table(colData(se_bambu)$donor, colData(se_bambu)$condition)
+
+cpm   <- assay(se_bambu, "CPM")
+is_wt <- colData(se_bambu)$condition == "WT"
+
+rowData(se_bambu)$cpm_WT <- rowMeans(cpm[,  is_wt, drop = FALSE])
+rowData(se_bambu)$cpm_KD <- rowMeans(cpm[, !is_wt, drop = FALSE])
+rowData(se_bambu)$lfc_WT_vs_KD <- log2((rowData(se_bambu)$cpm_WT + 1) /
+                                       (rowData(se_bambu)$cpm_KD + 1))
+rowData(se_bambu)$direction <- ifelse(
+  rowData(se_bambu)$cpm_WT > rowData(se_bambu)$cpm_KD, "up_in_WT",
+  ifelse(rowData(se_bambu)$cpm_WT < rowData(se_bambu)$cpm_KD, "up_in_KD", "tie")
+)
+
+# most `tie` rows are transcripts at zero in both groups
+table(rowData(se_bambu)$direction)
+table(rowData(se_bambu)$direction[rowMeans(cpm) > 1])
+```
+
+A quick look at the novel genes' expression, to see how much signal there is.
+
+```{r explore_novel, message=FALSE}
+xp <- se_bambu |> new_plyxp()
+xp_novel <- xp |>
+  filter(rows(novelGene)) |>
+  mutate(rows(mean_cpm = rowMeans(.assays_asis$CPM)))
+nrow(xp_novel)
+
+table(cut(log10(rowData(xp_novel)$mean_cpm), -3:3))
+hist(log10(rowData(xp_novel)$mean_cpm))
+```
+
+### Flat exon GRanges
+
+A flat `GRanges`, one range per exon, with the transcript-level annotation
+joined on. This is the exon object the splicelogic `find_*()` and `plot_*()`
+functions take.
+
+```{r build_exons}
+exons <- unlist(bdisc, use.names = TRUE)
+exons$tx_id <- names(exons)
+
+rd <- rowData(se_bambu)
+i  <- match(exons$tx_id, rd$TXNAME)
+stopifnot(!anyNA(i))
+
+cols    <- c("GENEID", "novelGene", "novelTranscript", "txClassDescription",
+             "NDR", "readCount", "relReadCount",
+             "cpm_WT", "cpm_KD", "lfc_WT_vs_KD", "direction")
+tx_info <- rd[, cols]
+tx_info$mean_cpm <- rowMeans(assay(se_bambu, "CPM"))
+tx_info$n_det    <- rowSums(assay(se_bambu, "counts") > 0)
+
+mcols(exons) <- cbind(mcols(exons), tx_info[i, ])
+names(mcols(exons))[names(mcols(exons)) == "GENEID"] <- "gene_id"
+
+# bambu exons carry no exon_id. Build one from gene + coordinates (per the
+# splicelogic vignette), so the same exon gets the same id in every transcript
+# that contains it.
+exons$exon_id <- paste0(exons$gene_id, ":",
+                        start(exons), "-", end(exons))
+```
+
+### Novel transcript counts
+
+The comparison keeps novel transcripts at **annotated** loci (so there is an
+annotated partner to compare against) and drops novel transcripts at entirely
+new loci.
+
+```{r novel_counts}
+count_gr <- function(gr, label) {
+  data.frame(set   = label,
+             exons = length(gr),
+             tx    = length(unique(gr$tx_id)),
+             genes = length(unique(gr$gene_id)))
+}
+
+rbind(
+  count_gr(exons, "all (extended annotation)"),
+  count_gr(exons[exons$novelTranscript],  "novel transcripts"),
+  count_gr(exons[!exons$novelTranscript], "annotated transcripts"),
+  count_gr(exons[exons$novelTranscript &  exons$novelGene], "  novel tx, NEW locus (drop)"),
+  count_gr(exons[exons$novelTranscript & !exons$novelGene], "  novel tx, annotated gene (keep)")
+) |> print(row.names = FALSE)
+```
+
+## Splice event detection with splicelogic
+
+The two partitions are defined explicitly (no DTU test): the **up** set is the
+novel transcripts at annotated loci, the **down** (reference) set is the
+annotated transcripts. `prepare_exons_by_partition()` assigns `estimate = +1`
+to up and `-1` to down.
+
+```{r find_events}
+up   <- exons |> dplyr::filter(!novelGene, novelTranscript)
+down <- exons |> dplyr::filter(!novelGene, !novelTranscript)
+
+# genes present in both partitions are the ones with a comparison to make
+length(intersect(unique(up$gene_id), unique(down$gene_id)))
+
+sl_exons <- prepare_exons_by_partition(up, down) |>
+  preprocess(coef_col = "estimate")
+
+events_bambu <- find_all_events(sl_exons)
+```
+
+An exon paired with several partner transcripts is reported once per partner,
+as repeated rows with the same range. Collapsing those per event type shows how
+much of the raw event count is that redundancy.
+
+```{r collapse_events}
+# define a helper function
+my_paste <- \(x) paste(unique(x), collapse = ",")
+
+collapsed_events <- events_bambu |>
+  dplyr::group_by(exon_id, event_type) |>
+  plyranges::reduce_ranges_directed(
+    n           = plyranges::n(),
+    tx_id       = my_paste(tx_id),
+    exon_rank   = my_paste(exon_rank),
+    event_tx_id = my_paste(event_tx_id)
+  )
+```
+
+```{r barplot_event_types}
+event_counts <- events_bambu |>
+  as_tibble() |>
+  dplyr::count(event_type, name = "count")
+
+collapsed_event_counts <- collapsed_events |>
+  as_tibble() |>
+  dplyr::count(event_type, name = "count")
+
+# combine both count tables into one, labelled by source
+counts <- dplyr::bind_rows(
+  "All events" = event_counts,
+  "Collapsed events" = collapsed_event_counts,
+  .id = "set"
+)
+
+ggplot(counts, aes(x = event_type, y = count, fill = set)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  scale_fill_manual(values = c(
+    "All events" = "#9ecae1",       # light blue
+    "Collapsed events" = "#3182bd"  # darker blue
+  )) +
+  labs(title = "Novel-transcript splice event counts",
+       x = "Event Type", y = "Count", fill = NULL) +
+  theme_bw()
+```
+
+## Per-transcript annotation for the plots
+
+One label per transcript (novel status, then the direction and the two group
+means) and a matching `log2(WT / KD)` value used to draw the LFC strip beside
+each transcript.
+
+```{r plot_annotation}
+# Pulled into a plain data.frame and read with with(): repeating `rd$` inside
+# one call makes the console's `$` completion eat the paste.
+d <- as.data.frame(rd[, c("TXNAME", "novelTranscript",
+                          "cpm_WT", "cpm_KD", "lfc_WT_vs_KD")])
+
+# novel/annot status, plus the direction and group means. A direction on two
+# near-zero means is rounding noise, not a change, so those read "n.d.".
+tx_annot <- with(d, paste0(
+  ifelse(novelTranscript, "novel", "annot"), " | ",
+  ifelse(cpm_WT + cpm_KD < 0.1, "n.d.",
+         sprintf("log2 %+.2f  (WT %.2f / KD %.2f)", lfc_WT_vs_KD, cpm_WT, cpm_KD))
+))
+names(tx_annot) <- d[["TXNAME"]]
+
+# log2(WT/KD) for the LFC strip: NA (no bar) where both groups are near zero.
+tx_lfc <- with(d, ifelse(cpm_WT + cpm_KD < 0.1, NA_real_, lfc_WT_vs_KD))
+names(tx_lfc) <- d[["TXNAME"]]
+
+# one shared scale so bar lengths mean the same thing on every page
+lfc_max <- quantile(abs(tx_lfc), 0.99, na.rm = TRUE)
+```
+
+## Plotting helpers
+
+Two small helpers that the package does not provide: a multi-page PDF writer,
+and a per-gene layout that places `plot_transcripts()` next to the companion
+`plot_transcript_lfc()` strip (the package draws them as separate plots; here
+`patchwork` composes them so they share row order and y limits).
+
+```{r plot_helpers}
+fig_dir <- here("workflows", "figures")
+dir.create(fig_dir, showWarnings = FALSE)
+
+# write a list of plots to one multi-page PDF, one plot per page
+write_pdf <- function(plots, file, width = 10, height = 6) {
+  grDevices::pdf(file, width = width, height = height, onefile = TRUE)
+  on.exit(grDevices::dev.off(), add = TRUE)
+  for (nm in names(plots)) print(plots[[nm]])
+  invisible(file)
+}
+
+# plot_transcripts() + plot_transcript_lfc() side by side, one pair per gene
+plot_gene_with_lfc <- function(events, exons, tx_lfc, lfc_max = NULL,
+                               tx_annot = NULL, lfc_ends = c("KD", "WT"),
+                               widths = c(5, 1.2), ...) {
+  genes <- unique(as.character(events$gene_id))
+  plots <- lapply(stats::setNames(genes, genes), function(g) {
+    ev <- events[as.character(events$gene_id) == g]
+    tryCatch({
+      p <- plot_transcripts(ev, exons, title = g, tx_annot = tx_annot, ...)
+      q <- plot_transcript_lfc(ev, tx_lfc, lfc_max = lfc_max,
+                               lfc_ends = lfc_ends)
+      patchwork::wrap_plots(p, q, widths = widths)
+    }, error = function(e) {
+      warning("Skipping ", g, ": ", conditionMessage(e))
+      NULL
+    })
+  })
+  Filter(Negate(is.null), plots)
+}
+```
+
+## Events for one gene
+
+`exons` is already the flat `GRanges` the package plotting functions take (one
+range per exon with a `tx_id` column), so it is passed directly.
+
+```{r plot_one_gene, fig.width=10, fig.height=6}
+gene_of_interest <- unique(as.character(events_bambu$gene_id))[1]
+events_for_gene  <- events_bambu[events_bambu$gene_id == gene_of_interest]
+
+p <- plot_transcripts(events_for_gene, exons, title = gene_of_interest,
+                      tx_annot = tx_annot)
+q <- plot_transcript_lfc(events_for_gene, tx_lfc, lfc_max = lfc_max,
+                         lfc_ends = c("KD", "WT"))
+patchwork::wrap_plots(p, q, widths = c(5, 1.2))
+```
+
+## All events, one page per gene (with the LFC strip)
+
+```{r plot_by_gene, eval=FALSE}
+gene_plots <- plot_gene_with_lfc(
+  events_bambu, exons,
+  tx_annot = tx_annot, tx_lfc = tx_lfc, lfc_max = lfc_max
+)
+length(gene_plots)
+
+write_pdf(gene_plots, file.path(fig_dir, "events_by_gene_bambu.pdf"))
+```
+
+## All events, one page per transcript pair
+
+`plot_transcripts_by_pair()` splits on the transcript pair internally, so
+`events_bambu` works directly.
+
+```{r plot_by_pair, eval=FALSE}
+pair_plots <- plot_transcripts_by_pair(events_bambu, exons)
+length(pair_plots)
+
+write_pdf(pair_plots, file.path(fig_dir, "events_by_pair_bambu.pdf"), height = 3)
+```
+
+## Novel transcripts split by direction
+
+Plot the novel transcripts separately by the direction of their WT/KD change.
+In each event row the novel transcript is the one from the `up` partition
+(`estimate > 0`): `tx_id` when the row's own estimate is positive, otherwise its
+partner `event_tx_id`.
+
+```{r novel_by_direction}
+ev <- as.data.frame(S4Vectors::mcols(events_bambu)[, c("tx_id", "event_tx_id",
+                                                       "estimate", "gene_id")])
+novel_tx  <- with(ev, ifelse(estimate > 0, as.character(tx_id),
+                             as.character(event_tx_id)))
+novel_lfc <- unname(tx_lfc[novel_tx])   # NA when the novel transcript is n.d.
+
+# which() drops the NA rows, so n.d. novel transcripts are in neither set
+events_novel_kd <- events_bambu[which(novel_lfc < 0)]
+events_novel_wt <- events_bambu[which(novel_lfc > 0)]
+
+n_genes <- function(keep) length(unique(ev[["gene_id"]][keep]))
+data.frame(
+  set    = c("all events", "novel tx higher in KD (< 0)",
+             "novel tx higher in WT (> 0)", "novel tx n.d. (not plotted)"),
+  events = c(nrow(ev), sum(novel_lfc < 0, na.rm = TRUE),
+             sum(novel_lfc > 0, na.rm = TRUE), sum(is.na(novel_lfc))),
+  genes  = c(n_genes(TRUE), n_genes(which(novel_lfc < 0)),
+             n_genes(which(novel_lfc > 0)), n_genes(is.na(novel_lfc)))
+)
+
+novel_sets <- list(novel_higher_in_KD = events_novel_kd,
+                   novel_higher_in_WT = events_novel_wt)
+```
+
+A gene with novel transcripts in both directions appears in both PDFs, each
+page showing only the novel transcripts of that direction and their partners.
+
+```{r plot_novel_by_direction, eval=FALSE}
+for (set in names(novel_sets)) {
+  set_plots <- plot_gene_with_lfc(
+    novel_sets[[set]], exons,
+    tx_annot = tx_annot, tx_lfc = tx_lfc, lfc_max = lfc_max
+  )
+  set_file <- file.path(fig_dir, paste0("events_", set, "_bambu.pdf"))
+  write_pdf(set_plots, set_file)
+  message(set, ": ", length(set_plots), " pages written to ", set_file)
+}
+```
+
+## Splice-site logos for the novel-transcript events
+
+Every event exon is a real spliced exon, so its flanking splice sites should be
+the canonical ones: the **3' acceptor** (`...AG |` exon) in the region
+**upstream** of the exon, and the **5' donor** (exon `| GU...`) **downstream**.
+This is a sanity check that the novel-transcript events sit at genuine splice
+sites. 
+
+```{r logo_helpers, message=FALSE}
+source(here("workflows/helper.R"))
+```
+
+```{r novel_splice_logo, message=FALSE, warning=FALSE, fig.width=9, fig.height=3.2}
+splice_events <- events_bambu[!events_bambu$event_type %in% c("atss", "ates")]
+
+# Restrict to the standard chromosomes: the bambu object carries hundreds of
+# _fix/_alt scaffolds that are not all in the BSgenome, which otherwise triggers
+# a noisy seqinfo-merge warning (and errors for exons on absent scaffolds).
+# pruning.mode = "coarse" drops ranges on non-standard seqlevels.
+splice_events <- GenomeInfoDb::keepStandardChromosomes(
+  splice_events, pruning.mode = "coarse"
+)
+GenomeInfoDb::seqlevels(splice_events) <-
+  GenomeInfoDb::seqlevelsInUse(splice_events)
+
+# 10 bp into the intron on each side (exon_bases = 0, so purely intronic):
+# the upstream logo should end in AG, the downstream logo should start with GU.
+novel_logo <- slFlankLogoMatrices(splice_events, genome = "hg38",
+                                  width = 10, exon_bases = 0)
+
+slPlotFlankLogo(novel_logo, method = "prob")
+```
+
+### Non-canonical splice sites
+
+To find the events that break the pattern, take the 2 intronic bases
+immediately flanking each exon — strand-aware, via `plyranges::flank_*()` — and
+read them with `get_seq()`. The acceptor (upstream) should be `AG`, the donor
+(downstream) `GU`. Anything else is flagged.
+
+```{r splice_dinucleotides, message=FALSE}
+# one row per distinct exon, so an exon paired with several partners is not
+# counted repeatedly
+ex_once <- slUniqueExons(splice_events)
+
+# 2 bp immediately 5' (acceptor) and 3' (donor) of each exon, in transcription
+# order; get_seq() reverse-complements minus-strand ranges automatically
+acceptor <- ex_once |> plyranges::flank_upstream(width = 2)
+donor    <- ex_once |> plyranges::flank_downstream(width = 2)
+
+ex_once$acceptor <- as.character(get_seq(acceptor, "hg38", as_rna = TRUE))
+ex_once$donor    <- as.character(get_seq(donor,    "hg38", as_rna = TRUE))
+ex_once$canonical <- ex_once$acceptor == "AG" & ex_once$donor == "GU"
+
+# how many follow the canonical AG/GU pattern
+table(canonical = ex_once$canonical)
+table(acceptor = ex_once$acceptor)
+table(donor = ex_once$donor)
+```
+
+```{r noncanonical_list}
+# the offenders: event exons whose acceptor is not AG or donor is not GU
+noncanonical <- ex_once[!ex_once$canonical]
+
+noncanonical |>
+  as_tibble() |>
+  dplyr::select(seqnames, start, end, strand, gene_id, tx_id, exon_rank,
+                event_type, acceptor, donor) |>
+  dplyr::arrange(acceptor, donor) |>
+  print(n = 20, width = Inf)
+```
+
+To eyeball one, read the whole exon with 5 intronic bases on each side, in
+transcription order (`get_seq()` reverse-complements the minus strand). The
+acceptor is the 2 intronic bases just before the exon (canonical `AG`), the
+donor the 2 intronic bases just after it (canonical `GU`):
+
+```{r inspect_one_noncanonical}
+one <- noncanonical[1]
+
+up5   <- get_seq(plyranges::flank_upstream(one,   width = 5), "hg38", as_rna = TRUE)
+exon  <- get_seq(one,                                         "hg38", as_rna = TRUE)
+down5 <- get_seq(plyranges::flank_downstream(one, width = 5), "hg38", as_rna = TRUE)
+
+# intron(5) | EXON | intron(5), 5'->3'
+cat(sprintf("%s | %s | %s\n", up5, exon, down5))
+
+data.frame(
+  intron_up_5   = as.character(up5),   # ...ends in AG for a canonical acceptor
+  exon          = as.character(exon),
+  intron_down_5 = as.character(down5)  # starts with GU for a canonical donor
+)
+```
+
