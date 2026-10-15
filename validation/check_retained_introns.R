@@ -17,13 +17,13 @@ pblocks <- read_tsv(
 
 # --- RI cases (I: anchor splices out intron, other retains it) --------------
 # other=up (has the big retaining exon), anchor=down (has the split exons)
+# detection only, so frameshift / split_codons are not filtered: they affect
+# the protein sequence, not the exon structure find_ri() looks at
 
 ri_cases <- pblocks |>
   filter(
     events == "frozenset({'I'})",
     !compound_splicing,
-    !frameshift,
-    !split_codons,
     aa_gain > 0
   ) |>
   group_by(anchor, other) |>
@@ -31,7 +31,7 @@ ri_cases <- pblocks |>
   ungroup()
 
 set.seed(5)
-sample_ri <- slice_sample(ri_cases, n = 2000)
+sample_ri <- slice_sample(ri_cases, n = min(2000, nrow(ri_cases)))
 
 source(here("validation/utils.R"))
 
