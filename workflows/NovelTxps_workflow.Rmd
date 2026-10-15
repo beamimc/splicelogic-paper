@@ -1,6 +1,10 @@
 ---
 title: "Novel Transcripts Workflow"
-output: html_document
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
 ---
 
 ```{r libraries, message=FALSE, warning=FALSE}
@@ -71,6 +75,64 @@ table(cut(log10(rowData(xp_novel)$mean_cpm), -3:3))
 hist(log10(rowData(xp_novel)$mean_cpm))
 ```
 
+### Expression filter
+
+Keep transcripts with raw count >= 10 in at least
+6 samples. Applied before building the exon
+object so both the novel (`up`) and annotated (`down`) partitions are filtered.
+
+```{r expression_filter}
+# transcripts per type, before and after the filter
+count_tx_type <- \(se) table(
+  tx_type = ifelse(rowData(se)$novelTranscript, "novel", "annotated")
+)
+n_before <- count_tx_type(se_bambu)
+
+min_count   <- 10
+min_samples <- 6
+keep_counts <- rowSums(assay(se_bambu, "counts") >= min_count) >= min_samples
+se_bambu    <- se_bambu[keep_counts, ]
+dim(se_bambu)
+
+n_after <- count_tx_type(se_bambu)
+```
+
+```{r plot_filter_counts, fig.width=6, fig.height=3.5}
+filter_counts <- dplyr::bind_rows(
+  "unfiltered" = as.data.frame(n_before, responseName = "n"),
+  "filtered"   = as.data.frame(n_after,  responseName = "n"),
+  .id = "stage"
+) |>
+  dplyr::mutate(stage = factor(stage, levels = c("unfiltered", "filtered"))) |>
+  dplyr::group_by(tx_type) |>
+  # the filtered bar also shows the share retained
+  dplyr::mutate(label = ifelse(
+    stage == "filtered",
+    sprintf("%s\n(%.1f%%)", scales::comma(n), 100 * n / max(n)),
+    scales::comma(n)
+  ))
+
+ggplot(filter_counts, aes(x = tx_type, y = n, fill = stage)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = label), position = position_dodge(width = 0.8),
+            vjust = -0.3, size = 3.2, lineheight = 0.9, colour = "grey20") +
+  scale_fill_manual(values = c(
+    "unfiltered" = "#B0CFFF",  # light blue
+    "filtered"   = "#3A86FF"   # darker blue
+  )) +
+  # log scale from 1: the annotated set is ~100x the novel set, so on a
+  # linear axis the novel bars would be slivers. Every decade is labelled.
+  scale_y_log10(breaks = 10^(0:6), minor_breaks = NULL,
+                labels = scales::comma, limits = c(1, NA),
+                expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Transcripts before and after the expression filter",
+       subtitle = sprintf("Filter: raw count ≥ %d in at least %d of %d samples",
+                          min_count, min_samples, ncol(se_bambu)),
+       x = NULL, y = "log(Number of Transcripts)", fill = NULL) +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
 ### Flat exon GRanges
 
 A flat `GRanges`, one range per exon, with the transcript-level annotation
@@ -81,8 +143,11 @@ functions take.
 exons <- unlist(bdisc, use.names = TRUE)
 exons$tx_id <- names(exons)
 
-rd <- rowData(se_bambu)
-i  <- match(exons$tx_id, rd$TXNAME)
+# bdisc carries every discovered transcript; keep only those retained by the
+# expression filter on se_bambu, so the match below is complete.
+rd    <- rowData(se_bambu)
+exons <- exons[exons$tx_id %in% rd$TXNAME]
+i     <- match(exons$tx_id, rd$TXNAME)
 stopifnot(!anyNA(i))
 
 cols    <- c("GENEID", "novelGene", "novelTranscript", "txClassDescription",
@@ -147,16 +212,23 @@ events_bambu <- find_all_events(sl_exons)
 
 An exon paired with several partner transcripts is reported once per partner,
 as repeated rows with the same range. Collapsing those per event type shows how
-much of the raw event count is that redundancy.
+much of the raw event count is that redundancy. Rows are collapsed only for the
+same exon (gene, chromosome, start, end, strand) and the same event type, as in
+the other workflows.
 
 ```{r collapse_events}
 # define a helper function
 my_paste <- \(x) paste(unique(x), collapse = ",")
 
+# the exon is identified by `exon_key` (gene, chromosome, start, end and
+# strand), built as in the vignette's recipe for an exon id, rather than by
+# `exon_id`: the annotation can give the same exon more than one id
 collapsed_events <- events_bambu |>
-  dplyr::group_by(exon_id, event_type) |>
+  dplyr::mutate(exon_key = paste(gene_id, seqnames, start, end, strand, sep = ":")) |>
+  dplyr::group_by(exon_key, event_type) |>
   plyranges::reduce_ranges_directed(
     n           = plyranges::n(),
+    exon_id     = my_paste(exon_id),
     tx_id       = my_paste(tx_id),
     exon_rank   = my_paste(exon_rank),
     event_tx_id = my_paste(event_tx_id)
@@ -179,15 +251,57 @@ counts <- dplyr::bind_rows(
   .id = "set"
 )
 
+# event types from most to fewest events
+counts$event_type <- factor(
+  counts$event_type,
+  levels = event_counts$event_type[order(-event_counts$count)]
+)
+
 ggplot(counts, aes(x = event_type, y = count, fill = set)) +
   geom_col(position = position_dodge(width = 0.8)) +
   scale_fill_manual(values = c(
-    "All events" = "#9ecae1",       # light blue
-    "Collapsed events" = "#3182bd"  # darker blue
+    "All events" = "#B0CFFF",       # light blue
+    "Collapsed events" = "#3A86FF"  # darker blue
   )) +
   labs(title = "Novel-transcript splice event counts",
        x = "Event Type", y = "Count", fill = NULL) +
   theme_bw()
+```
+
+```{r pie_collapsed_event_types, fig.width=6, fig.height=4.5}
+# event types in the package's order, with the package's colours, so each type
+# matches its colour in plot_transcripts()
+type_colors <- event_palette()
+type_order  <- names(type_colors)
+
+pie_counts <- collapsed_event_counts |>
+  dplyr::mutate(
+    event_type = factor(event_type, levels = type_order),
+    pct        = 100 * count / sum(count),
+    # slices under 5% are too thin to label; the legend carries them
+    label      = ifelse(pct >= 5,
+                        sprintf("%s\n%.1f%%", toupper(event_type), pct), "")
+  )
+
+legend_labels <- with(pie_counts, setNames(
+  sprintf("%s  %d (%.1f%%)", toupper(event_type), count, pct),
+  event_type
+))
+
+ggplot(pie_counts, aes(x = 1, y = count, fill = event_type)) +
+  geom_col(width = 1, colour = "white", linewidth = 0.5) +
+  # labels just outside the pie, at each slice's midpoint
+  geom_text(aes(x = 1.75, label = label, group = event_type),
+            position = position_stack(vjust = 0.5),
+            size = 3.2, lineheight = 0.9, colour = "grey20") +
+  # clockwise from 12 o'clock, in the same order as the legend
+  coord_polar(theta = "y", direction = -1) +
+  scale_x_continuous(limits = c(0.5, 2)) +
+  scale_fill_manual(values = type_colors, labels = legend_labels) +
+  labs(title = "Collapsed novel-transcript events by type",
+       subtitle = sprintf("n = %s", scales::comma(sum(pie_counts$count))),
+       fill = NULL) +
+  theme_void()
 ```
 
 ## Per-transcript annotation for the plots
@@ -265,7 +379,7 @@ plot_gene_with_lfc <- function(events, exons, tx_lfc, lfc_max = NULL,
 range per exon with a `tx_id` column), so it is passed directly.
 
 ```{r plot_one_gene, fig.width=10, fig.height=6}
-gene_of_interest <- unique(as.character(events_bambu$gene_id))[1]
+gene_of_interest <- unique(as.character(events_bambu$gene_id))[10]
 events_for_gene  <- events_bambu[events_bambu$gene_id == gene_of_interest]
 
 p <- plot_transcripts(events_for_gene, exons, title = gene_of_interest,
@@ -352,31 +466,94 @@ Every event exon is a real spliced exon, so its flanking splice sites should be
 the canonical ones: the **3' acceptor** (`...AG |` exon) in the region
 **upstream** of the exon, and the **5' donor** (exon `| GU...`) **downstream**.
 This is a sanity check that the novel-transcript events sit at genuine splice
-sites. 
+sites. A first exon has no acceptor (the bases before it are the transcription
+start) and a last exon no donor (the transcription end), so each side only uses
+the exons that actually have that splice site. Many novel events sit on
+terminal exons: most A5SS exons are first exons and most A3SS exons last ones.
+ATSS and ATES events are included on the same rule: an ATSS exon is a first
+exon, so only its donor is used, and an ATES exon a last exon, so only its
+acceptor.
 
 ```{r logo_helpers, message=FALSE}
 source(here("workflows/helper.R"))
 ```
 
 ```{r novel_splice_logo, message=FALSE, warning=FALSE, fig.width=9, fig.height=3.2}
-splice_events <- events_bambu[!events_bambu$event_type %in% c("atss", "ates")]
-
 # Restrict to the standard chromosomes: the bambu object carries hundreds of
 # _fix/_alt scaffolds that are not all in the BSgenome, which otherwise triggers
 # a noisy seqinfo-merge warning (and errors for exons on absent scaffolds).
 # pruning.mode = "coarse" drops ranges on non-standard seqlevels.
-splice_events <- GenomeInfoDb::keepStandardChromosomes(
-  splice_events, pruning.mode = "coarse"
-)
-GenomeInfoDb::seqlevels(splice_events) <-
-  GenomeInfoDb::seqlevelsInUse(splice_events)
+standard_chr <- function(gr) {
+  gr <- GenomeInfoDb::keepStandardChromosomes(gr, pruning.mode = "coarse")
+  GenomeInfoDb::seqlevels(gr) <- GenomeInfoDb::seqlevelsInUse(gr)
+  gr
+}
+
+# every event type, ATSS and ATES included: the first/last-exon rule below
+# keeps only the donor of an ATSS exon and the acceptor of an ATES exon
+splice_events <- standard_chr(events_bambu)
+
+# each event row describes the transcript that contains the exon: novel (the
+# up partition) or annotated (down). The annotated event exons are the SE
+# exons and one side of each MXE pair; everything else is novel.
+is_novel <- splice_events$novelTranscript
+
+# One 1-bp range per distinct splice site: the first base of an exon marks its
+# acceptor, the last base its donor (strand-aware). Flanking these gives the
+# same intronic bases as flanking the whole exon, and a boundary shared by
+# several transcripts counts once. Acceptors come from exons that are not
+# first, donors from exons that are not last (bambu's exon_endRank is 1 on the
+# last exon).
+acceptor_sites <- function(gr) {
+  gr <- GenomicRanges::granges(gr[gr$exon_rank > 1])
+  unique(GenomicRanges::resize(gr, 1, fix = "start"))
+}
+donor_sites <- function(gr) {
+  gr <- GenomicRanges::granges(gr[gr$exon_endRank > 1])
+  unique(GenomicRanges::resize(gr, 1, fix = "end"))
+}
 
 # 10 bp into the intron on each side (exon_bases = 0, so purely intronic):
 # the upstream logo should end in AG, the downstream logo should start with GU.
-novel_logo <- slFlankLogoMatrices(splice_events, genome = "hg38",
-                                  width = 10, exon_bases = 0)
+splice_site_mats <- function(gr) {
+  acc <- slFlankLogoMatrices(acceptor_sites(gr), genome = "hg38",
+                             width = 10, exon_bases = 0)
+  don <- slFlankLogoMatrices(donor_sites(gr), genome = "hg38",
+                             width = 10, exon_bases = 0)
+  structure(list(upstream = acc$upstream, downstream = don$downstream),
+            width = 10, exon_bases = 0,
+            n_sites = c(upstream   = attr(acc, "n_exons"),
+                        downstream = attr(don, "n_exons")))
+}
 
-slPlotFlankLogo(novel_logo, method = "prob")
+plot_splice_site_logo <- function(mats, title) {
+  n <- attr(mats, "n_sites")
+  slPlotFlankLogo(mats, method = "bits", titles = c(
+    upstream   = sprintf("Upstream: 3' splice site (acceptor), n = %d",
+                         n[["upstream"]]),
+    downstream = sprintf("Downstream: 5' splice site (donor), n = %d",
+                         n[["downstream"]])
+  )) +
+    patchwork::plot_annotation(
+      title   = title,
+      caption = paste("distinct sites; acceptors from non-first exons,",
+                      "donors from non-last exons")
+    )
+}
+
+novel_logo <- splice_site_mats(splice_events[is_novel])
+plot_splice_site_logo(novel_logo, "Event exons in novel transcripts")
+```
+
+As a reference, every exon of the annotated transcripts (the `down`
+partition), not only the annotated event exons, which are just the SE exons and
+one side of each MXE pair. These are GENCODE exons, so they should be almost
+entirely canonical.
+
+```{r annotated_splice_logo, message=FALSE, warning=FALSE, fig.width=9, fig.height=3.2}
+annotated_exons <- standard_chr(down)
+annotated_logo  <- splice_site_mats(annotated_exons)
+plot_splice_site_logo(annotated_logo, "All exons of annotated transcripts")
 ```
 
 ### Non-canonical splice sites
@@ -384,26 +561,160 @@ slPlotFlankLogo(novel_logo, method = "prob")
 To find the events that break the pattern, take the 2 intronic bases
 immediately flanking each exon — strand-aware, via `plyranges::flank_*()` — and
 read them with `get_seq()`. The acceptor (upstream) should be `AG`, the donor
-(downstream) `GU`. Anything else is flagged.
+(downstream) `GU`. Anything else is flagged. As for the logos, a first exon has
+no acceptor and a last exon no donor; those are recorded as `NA` and not
+checked.
 
 ```{r splice_dinucleotides, message=FALSE}
-# one row per distinct exon, so an exon paired with several partners is not
-# counted repeatedly
-ex_once <- slUniqueExons(splice_events)
+# one row per distinct exon within each set, so an exon paired with several
+# partners is not counted repeatedly
+ex_once <- c(slUniqueExons(splice_events[is_novel]),
+             slUniqueExons(splice_events[!is_novel]))
+# an exon of a single-exon transcript has no splice site to check
+ex_once <- ex_once[ex_once$exon_rank > 1 | ex_once$exon_endRank > 1]
 
 # 2 bp immediately 5' (acceptor) and 3' (donor) of each exon, in transcription
 # order; get_seq() reverse-complements minus-strand ranges automatically
 acceptor <- ex_once |> plyranges::flank_upstream(width = 2)
 donor    <- ex_once |> plyranges::flank_downstream(width = 2)
 
-ex_once$acceptor <- as.character(get_seq(acceptor, "hg38", as_rna = TRUE))
-ex_once$donor    <- as.character(get_seq(donor,    "hg38", as_rna = TRUE))
-ex_once$canonical <- ex_once$acceptor == "AG" & ex_once$donor == "GU"
+# NA where the exon has no such site: no acceptor before a first exon, no
+# donor after a last one
+ex_once$acceptor <- ifelse(
+  ex_once$exon_rank > 1,
+  as.character(get_seq(acceptor, "hg38", as_rna = TRUE)), NA
+)
+ex_once$donor <- ifelse(
+  ex_once$exon_endRank > 1,
+  as.character(get_seq(donor, "hg38", as_rna = TRUE)), NA
+)
+ex_once$canonical <- (is.na(ex_once$acceptor) | ex_once$acceptor == "AG") &
+                     (is.na(ex_once$donor)    | ex_once$donor    == "GU")
 
 # how many follow the canonical AG/GU pattern
 table(canonical = ex_once$canonical)
 table(acceptor = ex_once$acceptor)
 table(donor = ex_once$donor)
+table(novel = ex_once$novelTranscript, canonical = ex_once$canonical)
+```
+
+The comparison below counts splice sites rather than exons, in two sets: the
+splice sites of the novel event exons (`splice_events`, every event type),
+against every splice site of the annotated transcripts (`down`) as the
+reference. Each distinct site counts once per set, with the same first/last-exon
+rule as above, so an ATSS exon contributes only its donor and an ATES exon only
+its acceptor.
+
+```{r canonical_by_set, message=FALSE}
+# acceptor (AG) and donor (GU) dinucleotide of every distinct splice site
+site_canonical <- function(gr) {
+  read2 <- function(sites, flank) {
+    if (length(sites) == 0L) return(character(0))
+    as.character(get_seq(flank(sites, width = 2), "hg38", as_rna = TRUE))
+  }
+  acc <- read2(acceptor_sites(gr), plyranges::flank_upstream)
+  don <- read2(donor_sites(gr),    plyranges::flank_downstream)
+  dplyr::bind_rows(
+    tibble::tibble(site = "acceptor", seq = acc, canonical = acc == "AG"),
+    tibble::tibble(site = "donor",    seq = don, canonical = don == "GU")
+  )
+}
+
+novel_events <- splice_events[is_novel]
+
+site_sets <- dplyr::bind_rows(
+  "annotated transcripts" = site_canonical(annotated_exons),
+  "novel event exons"     = site_canonical(novel_events),
+  .id = "set"
+)
+
+site_sets |>
+  dplyr::count(set, site, canonical) |>
+  tidyr::pivot_wider(names_from = canonical, values_from = n,
+                     values_fill = 0L, names_prefix = "canonical_")
+
+# the novel event sites per event type: ATSS adds only donors, ATES only
+# acceptors (a site shared by two event types is listed under both)
+split(novel_events, novel_events$event_type) |>
+  lapply(site_canonical) |>
+  dplyr::bind_rows(.id = "event_type") |>
+  dplyr::count(event_type, site, canonical) |>
+  tidyr::pivot_wider(names_from = canonical, values_from = n,
+                     values_fill = 0L, names_prefix = "canonical_")
+
+canon_p <- fisher.test(table(site_sets$set, site_sets$canonical))$p.value
+canon_p
+```
+
+```{r plot_canonical_by_set, fig.width=7, fig.height=3}
+canon_counts <- site_sets |>
+  dplyr::mutate(
+    set  = factor(set, levels = c("annotated transcripts",
+                                  "novel event exons")),
+    site = factor(ifelse(canonical, "canonical (AG/GU)", "non-canonical"),
+                  levels = c("non-canonical", "canonical (AG/GU)"))
+  ) |>
+  dplyr::count(set, site) |>
+  # keep zero counts, so a set with no non-canonical sites still gets a label
+  tidyr::complete(set, site, fill = list(n = 0L)) |>
+  dplyr::group_by(set) |>
+  dplyr::mutate(frac  = n / sum(n),
+                label = sprintf("%s (%.1f%%)", scales::comma(n), 100 * frac),
+                set   = sprintf("%s\n(n = %s)", set, scales::comma(sum(n)))) |>
+  dplyr::ungroup() |>
+  # annotated at the bottom, novel event exons on top
+  dplyr::mutate(set = factor(set, levels = unique(set)))
+
+ggplot(canon_counts, aes(x = frac, y = set, fill = site)) +
+  # non-canonical share on the left
+  geom_col(position = position_stack(reverse = TRUE), width = 0.6) +
+  # non-canonical count just right of its segment, canonical at the bar's end
+  geom_text(data = \(d) dplyr::filter(d, site == "non-canonical"),
+            aes(label = label), hjust = 0, nudge_x = 0.01,
+            size = 3.5, colour = "grey20") +
+  geom_text(data = \(d) dplyr::filter(d, site == "canonical (AG/GU)"),
+            aes(x = 0.99, label = label), hjust = 1,
+            size = 3.5, colour = "grey20") +
+  scale_fill_manual(values = c("non-canonical"     = "#3A86FF",
+                               "canonical (AG/GU)" = "grey85")) +
+  scale_x_continuous(labels = scales::percent, expand = c(0, 0)) +
+  labs(title = "Canonical splice sites, novel event exons vs annotated",
+       subtitle = sprintf(paste0("distinct splice sites, ATSS donors and ATES ",
+                                 "acceptors included\nFisher's exact test p = %.2g"),
+                          canon_p),
+       x = "Share of splice sites", y = NULL, fill = NULL) +
+  theme_bw() +
+  theme(legend.position = "top",
+        # room for the "100%" axis label at the right edge
+        plot.margin = margin(5.5, 14, 5.5, 5.5))
+```
+
+The novel event exons on their own, counted as exons: an exon is canonical when
+every splice site it has is (so an ATSS exon is judged on its donor, an ATES
+exon on its acceptor).
+
+```{r barplot_novel_canonical, fig.width=4.5, fig.height=3.8}
+novel_exon_counts <- ex_once[ex_once$novelTranscript] |>
+  as_tibble() |>
+  dplyr::mutate(site = factor(
+    ifelse(canonical, "canonical (AG/GU)", "non-canonical"),
+    levels = c("canonical (AG/GU)", "non-canonical")
+  )) |>
+  dplyr::count(site, .drop = FALSE) |>
+  dplyr::mutate(label = sprintf("%d (%.1f%%)", n, 100 * n / sum(n)))
+
+ggplot(novel_exon_counts, aes(x = site, y = n, fill = site)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = label), vjust = -0.4, size = 3.5, colour = "grey20") +
+  scale_fill_manual(values = c("non-canonical"     = "#3A86FF",
+                               "canonical (AG/GU)" = "grey70"),
+                    guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Novel event exons",
+       subtitle = sprintf("n = %d exons\nATSS donors and ATES acceptors included",
+                          sum(novel_exon_counts$n)),
+       x = NULL, y = "Exons") +
+  theme_bw()
 ```
 
 ```{r noncanonical_list}
@@ -412,8 +723,8 @@ noncanonical <- ex_once[!ex_once$canonical]
 
 noncanonical |>
   as_tibble() |>
-  dplyr::select(seqnames, start, end, strand, gene_id, tx_id, exon_rank,
-                event_type, acceptor, donor) |>
+  dplyr::select(seqnames, start, end, strand, gene_id, tx_id,
+                novelTranscript, exon_rank, event_type, acceptor, donor) |>
   dplyr::arrange(acceptor, donor) |>
   print(n = 20, width = Inf)
 ```

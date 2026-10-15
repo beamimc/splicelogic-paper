@@ -162,32 +162,83 @@ slEventFlankProfiles <- function(events, genome, width = 100,
     )
 }
 
+# x-axis of the flank plots: bp from the exon every `break_every`, the exon
+# bar, and the splice site at the inner end of each flank. Upstream window i
+# sits at -width + i * step bp and is drawn at x = i, downstream window i at
+# +i * step bp, drawn at x = i + nwin + gap.
+.slFlankXAxis <- function(nwin, gap, width, step, break_every, exon_label) {
+    exon_x  <- nwin + (gap + 1) / 2
+    cand    <- seq(break_every, width, by = break_every)
+    up_bp   <- rev(-cand[-cand >= -width + step &
+                             -cand <= -width + nwin * step])
+    down_bp <- cand[cand >= step & cand <= nwin * step]
+    list(
+        exon_x = exon_x,
+        breaks = c((up_bp + width) / step, nwin, exon_x, nwin + gap + 1,
+                   down_bp / step + nwin + gap),
+        # the splice-site labels go on a second line, under the bp labels
+        labels = c(up_bp, "\n3'ss", exon_label, "\n5'ss",
+                   paste0("+", down_bp))
+    )
+}
+
+# The exon between the two flanks: the gridlines are blanked out across the
+# gap, so the exon stands on its own, and a thin bar stands in for it,
+# spanning the panel whatever its y range.
+.slFlankExonBar <- function(nwin, gap, exon_x) {
+    list(
+        ggplot2::annotate("rect",
+                          xmin = nwin + 0.5, xmax = nwin + gap + 0.5,
+                          ymin = -Inf, ymax = Inf, fill = "white"),
+        ggplot2::annotate("rect",
+                          xmin = exon_x - 0.2, xmax = exon_x + 0.2,
+                          ymin = -Inf, ymax = Inf, fill = "grey75")
+    )
+}
+
+# Shared look of the flank plots: no axis lines or ticks, only light
+# horizontal gridlines.
+.slFlankTheme <- function() {
+    ggplot2::theme_classic() +
+        ggplot2::theme(
+            legend.position    = "top",
+            axis.line          = ggplot2::element_blank(),
+            axis.ticks         = ggplot2::element_blank(),
+            axis.text          = ggplot2::element_text(colour = "grey40"),
+            panel.grid.major.y = ggplot2::element_line(colour = "grey85",
+                                                       linewidth = 0.3)
+        )
+}
+
 #' Plot the nucleotide composition flanking a set of exons
 #'
 #' Mean nucleotide fraction per window, upstream and downstream panels split by
-#' a gap standing in for the exon itself, with standard-error bars.
+#' a thin bar standing in for the exon itself, with standard-error bars.
 #'
 #' @param profiles Either the list returned by [slEventFlankProfiles()] or the
 #'   upstream matrix, with the downstream matrix passed as `downstream`.
 #' @param downstream Downstream matrix, when `profiles` is a matrix.
-#' @param exon_label Label drawn in the middle box, e.g. `"SE"`.
+#' @param exon_label x-axis label under the exon bar, e.g. `"SE"`.
 #' @param width,step Flank width (bp) and distance (bp) between consecutive
 #'   window starts. Taken from the attributes of `profiles` when available.
-#' @param gap Width of the exon box, in window units.
+#' @param gap Space between the two flanks, in window units. The exon bar sits
+#'   in the middle of it.
+#' @param break_every Spacing (bp) of the labelled x-axis positions.
 #' @param ylim y-axis range (the panel is clipped to it, means use every window).
-#' @param hlines y values of horizontal reference lines, also used as the
-#'   y-axis breaks. `NULL` for none.
+#' @param hlines y-axis breaks, each with a light gridline. `NULL` for the
+#'   default breaks.
 #' @param palette Named colour vector for the four nucleotides.
 #' @return A `ggplot` object.
 slPlotFlankProfiles <- function(profiles, downstream = NULL,
-                                exon_label = "exon",
-                                width   = NULL,
-                                step    = NULL,
-                                gap     = 8,
-                                ylim    = c(0, 0.7),
-                                hlines  = seq(ylim[1], ylim[2], by = 0.1),
-                                palette = c(A = "#F84040", C = "skyblue",
-                                            G = "#FFB400", U = "#06D6A0")) {
+                                exon_label  = "exon",
+                                width       = NULL,
+                                step        = NULL,
+                                gap         = 4,
+                                break_every = 30,
+                                ylim        = c(0, 0.7),
+                                hlines      = seq(ylim[1], ylim[2], by = 0.1),
+                                palette     = c(A = "#3A86FF", C = "#F0545C",
+                                                G = "#2EB67D", U = "#F2B705")) {
 
     if (is.list(profiles) && !is.matrix(profiles)) {
         if (is.null(width)) width <- attr(profiles, "width")
@@ -226,51 +277,234 @@ slPlotFlankProfiles <- function(profiles, downstream = NULL,
     up$x   <- up$win_idx
     down$x <- down$win_idx + nwin + gap
     df     <- dplyr::bind_rows(up, down)
-
-    breaks <- c(seq_len(nwin), seq_len(nwin) + nwin + gap)
-    labels <- c(-width + seq_len(nwin) * step, seq_len(nwin) * step)
-    labels[seq(2, length(labels), by = 2)] <- ""
-
-    xmin <- nwin + 0.5
-    xmax <- nwin + gap + 0.5
-    ymid <- mean(ylim)
-    yoff <- diff(ylim) * 0.07
+    ax     <- .slFlankXAxis(nwin, gap, width, step, break_every, exon_label)
 
     ggplot2::ggplot(df, ggplot2::aes(
         x = .data$x, y = .data$value, color = .data$nt,
         group = interaction(.data$set, .data$nt)
     )) +
-        # drawn first so the exon box and the profiles sit on top
-        (if (length(hlines) > 0L) {
-            ggplot2::geom_hline(yintercept = hlines, colour = "grey85",
-                                linewidth = 0.3)
-        }) +
-        ggplot2::annotate("rect",
-                          xmin = xmin, xmax = xmax,
-                          ymin = ymid - yoff, ymax = ymid + yoff,
-                          fill = "grey70") +
-        ggplot2::annotate("text",
-                          x = (xmin + xmax) / 2, y = ymid,
-                          label = exon_label, fontface = "bold") +
         ggplot2::stat_summary(fun      = mean,    geom = "line",
-                              linewidth = 1) +
+                              linewidth = 0.8) +
         ggplot2::stat_summary(fun.data = ggplot2::mean_se, geom = "errorbar",
                               width = 0.2) +
+        .slFlankExonBar(nwin, gap, ax$exon_x) +
         ggplot2::scale_color_manual(values = palette) +
-        ggplot2::scale_x_continuous(breaks = breaks, labels = labels) +
+        ggplot2::scale_x_continuous(breaks = ax$breaks, labels = ax$labels) +
         ggplot2::scale_y_continuous(
             breaks = if (length(hlines) > 0L) hlines else ggplot2::waiver(),
-            expand = c(0, 0)
+            expand = ggplot2::expansion(mult = 0.02)
         ) +
         # clipped rather than filtered, so the means use every window
         ggplot2::coord_cartesian(ylim = ylim) +
-        ggplot2::labs(x = "Relative location (bp)",
-                      y = "Nucleotide percentage (%)",
+        ggplot2::labs(x = "Relative position in intronic sequence (nt)",
+                      y = "Nucleotide fraction",
                       color = "Nucleotide") +
-        ggplot2::theme_classic() +
+        .slFlankTheme()
+}
+
+#' Compare the flanking nucleotide composition of several exon sets
+#'
+#' One panel per nucleotide, with the mean fraction per window of each exon set
+#' overlaid as a line and a standard-error ribbon. The first set (e.g. SE) is
+#' drawn solid in the nucleotide's colour, the others (e.g. non-SE) in
+#' `background` with their own line type. With `difference = TRUE`, plots the
+#' first set minus the second instead, shaded to zero.
+#'
+#' The exon is drawn as a thin bar between the two flanks, so the x-axis runs
+#' through the intronic sequence on either side: the 3' splice site ends the
+#' upstream flank and the 5' splice site starts the downstream one.
+#'
+#' @param profiles A named list of [slEventFlankProfiles()] results, all built
+#'   with the same `width`, `window_width` and `overlap`. The names label the
+#'   sets in the legend.
+#' @param difference If `TRUE`, plot the difference between the mean fractions
+#'   of the two sets (first minus second). Needs exactly two sets.
+#' @param exon_label x-axis label under the exon bar.
+#' @param gap Space between the two flanks, in window units. The exon bar sits
+#'   in the middle of it.
+#' @param break_every Spacing (bp) of the labelled x-axis positions.
+#' @param ylim y-axis range shared by every panel. `NULL` (the default) gives
+#'   each nucleotide its own range, so small differences between sets stay
+#'   visible, or with `difference = TRUE` one range symmetric around zero.
+#' @param ncol Number of panel columns.
+#' @param palette Named colour vector for the four nucleotides, used for the
+#'   first set.
+#' @param background Colour for every set after the first.
+#' @param linetypes Line types for the sets, named by set or in set order.
+#' @return A `ggplot` object.
+slPlotFlankProfilesByNt <- function(profiles,
+                                    difference  = FALSE,
+                                    exon_label  = "exon",
+                                    gap         = 4,
+                                    break_every = 30,
+                                    ylim        = NULL,
+                                    ncol        = 1,
+                                    palette     = c(A = "#3A86FF",
+                                                    C = "#F0545C",
+                                                    G = "#2EB67D",
+                                                    U = "#F2B705"),
+                                    background  = "grey50",
+                                    linetypes   = c("solid", "dashed",
+                                                    "dotted", "dotdash")) {
+
+    if (!is.list(profiles) || is.matrix(profiles) ||
+        is.null(names(profiles)) || any(names(profiles) == "")) {
+        stop("`profiles` must be a named list of slEventFlankProfiles() ",
+             "results, e.g. list(SE = se_profiles, `non-SE` = bg_profiles).")
+    }
+    params <- lapply(profiles, function(p) {
+        c(attr(p, "width"), attr(p, "window_width"), attr(p, "overlap"))
+    })
+    if (length(unique(params)) != 1L) {
+        stop("All profiles must share the same width, window_width and ",
+             "overlap.")
+    }
+    width <- params[[1]][1]
+    step  <- params[[1]][2] - params[[1]][3]
+
+    sets <- names(profiles)
+    if (difference && length(sets) != 2L) {
+        stop("`difference = TRUE` needs exactly two sets, got ",
+             length(sets), ".")
+    }
+    if (length(linetypes) < length(sets)) {
+        stop("`linetypes` has ", length(linetypes), " line types for ",
+             length(sets), " sets.")
+    }
+    if (is.null(names(linetypes))) {
+        linetypes <- stats::setNames(linetypes[seq_along(sets)], sets)
+    }
+
+    to_long <- function(mat, set, side) {
+        as.data.frame(mat) |>
+            tibble::rownames_to_column("rep") |>
+            tidyr::pivot_longer(
+                -"rep",
+                names_to  = c("window", "nt"),
+                names_sep = "_",
+                values_to = "value"
+            ) |>
+            dplyr::mutate(
+                set     = set,
+                side    = side,
+                win_idx = as.integer(sub("w", "", .data$window))
+            )
+    }
+
+    up <- dplyr::bind_rows(lapply(sets, function(s) {
+        to_long(profiles[[s]]$upstream, s, "upstream")
+    }))
+    down <- dplyr::bind_rows(lapply(sets, function(s) {
+        to_long(profiles[[s]]$downstream, s, "downstream")
+    }))
+    nwin <- max(up$win_idx)
+
+    up$x   <- up$win_idx
+    down$x <- down$win_idx + nwin + gap
+    # the first set takes the nucleotide's colour, the rest share `background`
+    df     <- dplyr::bind_rows(up, down) |>
+        dplyr::mutate(
+            hue = ifelse(.data$set == sets[1], .data$nt, .data$set),
+            set = factor(.data$set, levels = sets)
+        )
+    hues <- c(palette, stats::setNames(rep(background, length(sets) - 1L),
+                                       sets[-1]))
+    ax   <- .slFlankXAxis(nwin, gap, width, step, break_every, exon_label)
+
+    if (difference) {
+        df <- df |>
+            dplyr::group_by(.data$nt, .data$side, .data$x, .data$set) |>
+            dplyr::summarise(value = mean(.data$value), .groups = "drop") |>
+            tidyr::pivot_wider(names_from = "set", values_from = "value") |>
+            dplyr::mutate(
+                value = .data[[sets[1]]] - .data[[sets[2]]]
+            )
+        if (is.null(ylim)) {
+            ylim <- c(-1, 1) * max(abs(df$value), na.rm = TRUE) * 1.1
+        }
+        # gridlines at zero and one round value either side of it
+        top <- pretty(c(0, ylim[2]), n = 2)
+        top <- max(top[top <= ylim[2]])
+
+        p <- ggplot2::ggplot(df, ggplot2::aes(
+            x = .data$x, y = .data$value, group = .data$side
+        )) +
+            ggplot2::geom_hline(yintercept = 0, colour = "grey40",
+                                linewidth = 0.4) +
+            ggplot2::geom_ribbon(ggplot2::aes(ymin = 0, ymax = .data$value,
+                                              fill = .data$nt),
+                                 alpha = 0.3) +
+            ggplot2::geom_line(ggplot2::aes(colour = .data$nt),
+                               linewidth = 0.8) +
+            ggplot2::scale_colour_manual(values = palette, guide = "none") +
+            ggplot2::scale_fill_manual(values = palette, guide = "none") +
+            ggplot2::scale_y_continuous(
+                breaks = c(-top, 0, top),
+                labels = scales::label_number(style_positive = "plus"),
+                expand = ggplot2::expansion(mult = 0.02)
+            ) +
+            ggplot2::labs(
+                y        = paste0("\u0394 nucleotide fraction (", sets[1],
+                                  " \u2212 ", sets[2], ")"),
+                subtitle = paste0("Above the line: higher in ", sets[1],
+                                  " \u00b7 below: lower in ", sets[1])
+            )
+    } else {
+        p <- ggplot2::ggplot(df, ggplot2::aes(
+            x = .data$x, y = .data$value,
+            group = interaction(.data$side, .data$set)
+        )) +
+            ggplot2::stat_summary(ggplot2::aes(fill = .data$hue),
+                                  fun.data = ggplot2::mean_se,
+                                  geom = "ribbon", alpha = 0.25, colour = NA) +
+            ggplot2::stat_summary(ggplot2::aes(colour   = .data$hue,
+                                               linetype = .data$set),
+                                  fun = mean, geom = "line",
+                                  linewidth = 0.8) +
+            # the panel titles already name the nucleotide, so only the sets
+            # get a legend
+            ggplot2::scale_colour_manual(values = hues, guide = "none") +
+            ggplot2::scale_fill_manual(values = hues, guide = "none") +
+            ggplot2::scale_linetype_manual(
+                values = linetypes,
+                guide  = ggplot2::guide_legend(override.aes = list(
+                    colour = c("grey20", rep(background, length(sets) - 1L))
+                ))
+            ) +
+            # little padding above and below, so the profiles fill the panel,
+            # and two or three gridlines per panel at round values
+            ggplot2::scale_y_continuous(
+                breaks = function(l) {
+                    b <- pretty(l, n = 4)
+                    b <- b[b >= l[1] & b <= l[2]]
+                    if (length(b) > 3L) b <- b[seq(1L, length(b), by = 2L)]
+                    b
+                },
+                expand = ggplot2::expansion(mult = 0.02)
+            ) +
+            ggplot2::labs(y = "Nucleotide fraction", linetype = NULL)
+    }
+
+    p +
+        .slFlankExonBar(nwin, gap, ax$exon_x) +
+        ggplot2::facet_wrap(
+            ~ nt, ncol = ncol, strip.position = "left",
+            scales = if (is.null(ylim)) "free_y" else "fixed"
+        ) +
+        ggplot2::scale_x_continuous(breaks = ax$breaks, labels = ax$labels) +
+        # clipped rather than filtered, so the means use every window
+        ggplot2::coord_cartesian(ylim = ylim) +
+        ggplot2::labs(x = "Relative position in intronic sequence (nt)") +
+        .slFlankTheme() +
         ggplot2::theme(
-            legend.position = "top",
-            axis.text.x     = ggplot2::element_text(angle = 45, hjust = 1)
+            legend.key.width   = ggplot2::unit(1.5, "cm"),
+            strip.background   = ggplot2::element_blank(),
+            strip.placement    = "outside",
+            strip.text.y.left  = ggplot2::element_text(angle = 0,
+                                                       face = "bold",
+                                                       size = 14),
+            # room between the panels so each exon bar is separate
+            panel.spacing.y    = ggplot2::unit(1, "lines")
         )
 }
 
@@ -518,8 +752,8 @@ slPlotFlankLogo <- function(mats,
                             method  = c("prob", "bits"),
                             titles  = c(upstream   = "Upstream: 3' splice site (acceptor)",
                                         downstream = "Downstream: 5' splice site (donor)"),
-                            palette = c(A = "#F84040", C = "skyblue",
-                                        G = "#FFB400", U = "#06D6A0"),
+                            palette = c(A = "#3A86FF", C = "#F0545C",
+                                        G = "#2EB67D", U = "#F2B705"),
                             exon_fill   = "grey70",
                             break_every = 5) {
 
