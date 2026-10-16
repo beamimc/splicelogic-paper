@@ -218,27 +218,35 @@ slEventFlankProfiles <- function(events, genome, width = 100,
 #' @param profiles Either the list returned by [slEventFlankProfiles()] or the
 #'   upstream matrix, with the downstream matrix passed as `downstream`.
 #' @param downstream Downstream matrix, when `profiles` is a matrix.
-#' @param exon_label x-axis label under the exon bar, e.g. `"SE"`.
+#' @param exon_label Label under the exon bar, e.g. `"SE"`.
+#' @param exon_label_size Text size of `exon_label`, in mm as for
+#'   [ggplot2::geom_text()].
 #' @param width,step Flank width (bp) and distance (bp) between consecutive
 #'   window starts. Taken from the attributes of `profiles` when available.
 #' @param gap Space between the two flanks, in window units. The exon bar sits
 #'   in the middle of it.
 #' @param break_every Spacing (bp) of the labelled x-axis positions.
-#' @param ylim y-axis range (the panel is clipped to it, means use every window).
+#' @param ylim y-axis range. The means use every window, but the panel is not
+#'   clipped (the exon label is drawn below it), so a mean outside `ylim` is
+#'   drawn past the panel edge.
 #' @param hlines y-axis breaks, each with a light gridline. `NULL` for the
 #'   default breaks.
 #' @param palette Named colour vector for the four nucleotides.
 #' @return A `ggplot` object.
 slPlotFlankProfiles <- function(profiles, downstream = NULL,
-                                exon_label  = "exon",
-                                width       = NULL,
-                                step        = NULL,
-                                gap         = 4,
-                                break_every = 30,
-                                ylim        = c(0, 0.7),
-                                hlines      = seq(ylim[1], ylim[2], by = 0.1),
-                                palette     = c(A = "#3A86FF", C = "#F0545C",
-                                                G = "#2EB67D", U = "#F2B705")) {
+                                exon_label      = "exon",
+                                exon_label_size = 5,
+                                width           = NULL,
+                                step            = NULL,
+                                gap             = 4,
+                                break_every     = 30,
+                                ylim            = c(0, 0.7),
+                                hlines          = seq(ylim[1], ylim[2],
+                                                      by = 0.1),
+                                palette         = c(A = "#3A86FF",
+                                                    C = "#F0545C",
+                                                    G = "#2EB67D",
+                                                    U = "#F2B705")) {
 
     if (is.list(profiles) && !is.matrix(profiles)) {
         if (is.null(width)) width <- attr(profiles, "width")
@@ -277,7 +285,9 @@ slPlotFlankProfiles <- function(profiles, downstream = NULL,
     up$x   <- up$win_idx
     down$x <- down$win_idx + nwin + gap
     df     <- dplyr::bind_rows(up, down)
-    ax     <- .slFlankXAxis(nwin, gap, width, step, break_every, exon_label)
+    # the exon label is left off the axis, which has one text size for every
+    # label, and drawn under the exon bar as its own, larger text
+    ax     <- .slFlankXAxis(nwin, gap, width, step, break_every, "")
 
     ggplot2::ggplot(df, ggplot2::aes(
         x = .data$x, y = .data$value, color = .data$nt,
@@ -288,18 +298,33 @@ slPlotFlankProfiles <- function(profiles, downstream = NULL,
         ggplot2::stat_summary(fun.data = ggplot2::mean_se, geom = "errorbar",
                               width = 0.2) +
         .slFlankExonBar(nwin, gap, ax$exon_x) +
+        # placed in points below the panel, under the two lines of axis text
+        # (bp, then splice sites), so it clears the splice-site labels
+        ggplot2::annotation_custom(
+            grid::textGrob(
+                exon_label, y = grid::unit(-22, "pt"), vjust = 1,
+                gp = grid::gpar(fontsize = exon_label_size * ggplot2::.pt,
+                                fontface = "bold", col = "grey20")
+            ),
+            xmin = ax$exon_x, xmax = ax$exon_x, ymin = -Inf, ymax = -Inf
+        ) +
         ggplot2::scale_color_manual(values = palette) +
         ggplot2::scale_x_continuous(breaks = ax$breaks, labels = ax$labels) +
         ggplot2::scale_y_continuous(
             breaks = if (length(hlines) > 0L) hlines else ggplot2::waiver(),
             expand = ggplot2::expansion(mult = 0.02)
         ) +
-        # clipped rather than filtered, so the means use every window
-        ggplot2::coord_cartesian(ylim = ylim) +
+        # limited rather than filtered, so the means use every window; not
+        # clipped, so the exon label can sit below the panel
+        ggplot2::coord_cartesian(ylim = ylim, clip = "off") +
         ggplot2::labs(x = "Relative position in intronic sequence (nt)",
                       y = "Nucleotide fraction",
                       color = "Nucleotide") +
-        .slFlankTheme()
+        .slFlankTheme() +
+        # room for the exon label between the axis text and the axis title
+        ggplot2::theme(axis.title.x = ggplot2::element_text(
+            margin = ggplot2::margin(t = exon_label_size * ggplot2::.pt + 6)
+        ))
 }
 
 #' Compare the flanking nucleotide composition of several exon sets

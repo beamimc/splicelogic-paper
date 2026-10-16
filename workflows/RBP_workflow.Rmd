@@ -249,7 +249,7 @@ for (gene in names(plots)) {
 dev.off()
 ```
 
-## Collapse repeated exons
+## Collapse redundant events
 
 `find_se()` returns an exon once per transcript pair it is part of: an exon in
 two down transcripts and skipped by two up ones comes back four times. The event counts above already collapse these (`collapsed_events`). For
@@ -346,7 +346,7 @@ dim(se_profiles$upstream)
 dim(se_profiles$downstream)
 ```
 
-## Background set
+### Background set
 
 We want to compare the sequence context of the events with that of a control set.
 For the control set (non-event exons), we sample as many exons as there are in

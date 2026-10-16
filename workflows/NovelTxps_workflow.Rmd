@@ -210,13 +210,15 @@ sl_exons <- prepare_exons_by_partition(up, down) |>
 events_bambu <- find_all_events(sl_exons)
 ```
 
+### Collapse redundant events
+
 An exon paired with several partner transcripts is reported once per partner,
 as repeated rows with the same range. Collapsing those per event type shows how
 much of the raw event count is that redundancy. Rows are collapsed only for the
 same exon (gene, chromosome, start, end, strand) and the same event type, as in
 the other workflows.
 
-```{r collapse_events}
+```{r collapse_redundant_events}
 # define a helper function
 my_paste <- \(x) paste(unique(x), collapse = ",")
 
