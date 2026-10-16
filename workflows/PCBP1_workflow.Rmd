@@ -5,6 +5,7 @@ output:
     toc: true
     toc_float: true
     toc_depth: 3
+    code_folding: show
 ---
 
 Data: "Iron-sensitive RNA regulation by poly C binding proteins" (PMID 41036621),
@@ -16,6 +17,25 @@ GENCODE v43:
   [P1KD]: shRNA against luciferase (`shCtrl`) or PCBP1 (`shPCBP1`).
 - [GSE279949](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE279949)
   [chelator]: DMSO (control) or iron chelator 21H7 (`CHEL`), overnight.
+
+The two DTU comparisons at a glance. In each contrast the first term is the
+test group and the subtracted one the reference; the test group is the
+condition with more PCBP1 activity, so it is the up side for splicelogic.
+
+| | PCBP1 knockdown (GSE279951) | Iron chelation (GSE279949) |
+|---|---|---|
+| Contrast | `WT_vs_KD = conditionWT - conditionKD` | `CHEL_vs_DMSO = conditionCHEL - conditionDMSO` |
+| Test group (up) | `WT` (shCtrl) | `CHEL` (21H7) |
+| Reference (down) | `KD` (shPCBP1) | `DMSO` |
+| Positive estimate | transcript used more in WT | transcript used more after chelation |
+| IE event | exon in WT transcripts, lost after KD | exon in chelated transcripts, absent from DMSO ones |
+| FDR filter | `regular_FDR < 0.1` | `regular_FDR < 0.1` |
+
+
+```{r fold_setup, include=FALSE}
+# fold the code of the setup chunks, up to the event counts
+knitr::opts_chunk$set(class.source = "fold-hide")
+```
 
 ```{r libraries, message=FALSE, warning=FALSE}
 library(splicelogic)
@@ -269,32 +289,24 @@ chelator comparison gets the same steps in its own section below.
 
 ### Direction of the events
 
-WT (PCBP1 present) is the up side and KD (no PCBP1) the reference. The contrast
-is `WT_vs_KD = conditionWT - conditionKD`, so a positive estimate means the
-transcript is used more in WT. splicelogic treats the down transcripts as the
-reference, so every event describes what WT transcripts do compared with KD
-ones, as in the RBP workflow. With `~ 0 + condition` there is no intercept, so
+WT (PCBP1 present) is the up side and KD (no PCBP1) the reference. In the
+contrast `WT_vs_KD = conditionWT - conditionKD`, WT is the test group and KD the
+reference (the subtracted term), so the estimate is WT minus KD: positive when a
+transcript is used more in WT, negative when it is used more in KD. This
+reverses the usual way of describing a knockdown ("KD vs control"), so that the
+up side is the condition with PCBP1 present. splicelogic treats the down
+(negative-estimate) transcripts as the reference, so every event describes what
+WT transcripts do compared with KD ones, as in the RBP workflow. With `~ 0 + condition` there is no intercept, so
 the level order (`levels = c("KD", "WT")`) does not change the fit: the
 contrast alone sets the direction.
 
 | Event | What happens | What it suggests about PCBP1 |
 |---|---|---|
 | IE | Exon is in WT transcripts and lost after KD | PCBP1 promotes inclusion |
-| SE | Exon is skipped in WT transcripts and gained after KD | PCBP1 represses inclusion (promotes skipping) |
 
 PCBP1 binding upstream of an exon typically promotes its inclusion, and
-knockdown lowers it, so that pattern shows up as IE events.
-SE events are kept as the context-dependent group, and the two sets are
-compared in the sequence-context analysis below.
-
-The source paper ("Iron-sensitive RNA regulation by poly C binding proteins",
-PMID 41036621) reports the same direction with rMATS: after PCBP1 knockdown,
-4177 cassette exons were skipped and 2218 included (Fig. 2K), and PCBP1
-overexpression shifted the balance the other way (1233 skipped, 2126 included;
-Fig. 2M), so PCBP1 primarily promotes exon inclusion. They read the direction
-from the KD side and we read it from the WT side, so their exons skipped after
-KD are our IE events and their exons included after KD are our SE events. If
-our results agree, IE events should outnumber SE events.
+knockdown lowers it, so that pattern shows up as IE events, which the analyses
+below focus on.
 
 ```{r preprare_exons}
 # prepare exons for splicelogic
@@ -304,9 +316,6 @@ sig_exons <- prepare_exons(
 ```
 
 ```{r find_events}
-#find se
-se_events <- sig_exons |> preprocess(coef_col = "estimates")|> find_se()
-
 #find ie
 ie_events <- sig_exons |> preprocess(coef_col = "estimates") |> find_ie()
 
@@ -332,6 +341,11 @@ collapsed_events <- events |>
         exon_rank = my_paste(exon_rank),
         event_tx_id = my_paste(event_tx_id),
   )
+```
+
+```{r unfold_kd, include=FALSE}
+# from the event counts on, the code is shown
+knitr::opts_chunk$set(class.source = NULL)
 ```
 
 ```{r barplot_event_types}
@@ -370,8 +384,9 @@ ggplot(counts, aes(x = event_type, y = count, fill = set)) +
 ```
 
 ```{r plot_events_by_gene}
-# use splicelogic's built-in plotting function to visualize events for a specific gene
-gene_of_interest <- events$gene_id[1]
+# use splicelogic's built-in plotting function to visualize events for a specific gene:
+# the one with the most IE events
+gene_of_interest <- names(sort(table(ie_events$gene_id), decreasing = TRUE))[1]
 # filter events for the gene of interest
 events_for_gene <- events[events$gene_id == gene_of_interest]
 
@@ -392,24 +407,23 @@ for (gene in names(plots)) {
 dev.off()
 ```
 
-## Collapse repeated exons
+## Collapse redundant events
 
-`find_ie()` and `find_se()` return an exon once per transcript pair it is part
-of: an exon in two up transcripts and skipped by two down ones comes back four
-times. The event counts above already collapse these (`collapsed_events`). For
+`find_ie()` returns an exon once per transcript pair it is part of: an exon in
+two up transcripts and skipped by two down ones comes back four times. The event counts above already collapse these (`collapsed_events`). For
 the sequence analyses below we also keep one row per exon, so that an exon
 shared by many transcripts does not weigh more in the profiles and logos, and
 the background set is sized by exons rather than pairs. `n` records how many
 pairs each exon came from. The collapse is the same as in
-`collapse_redundant_events`, applied to the IE and SE events, and like it
+`collapse_redundant_events`, applied to the IE events, and like it
 collapses rows only for the same exon (gene, chromosome, start, end, strand)
 and the same event type. Set `collapse_exons <- FALSE` to run the sequence
-analyses on every event instead, as before the collapse; the collapsed sets
-stay available as `ie_collapsed` and `se_collapsed`.
+analyses on every event instead, as before the collapse; the collapsed set
+stays available as `ie_collapsed`.
 
-```{r collapse_ie_se}
+```{r collapse_ie}
 # TRUE: the sequence analyses below use one row per exon. FALSE: they use every
-# IE and SE event, one row per transcript pair, as before the collapse, to
+# IE event, one row per transcript pair, as before the collapse, to
 # compare
 collapse_exons <- TRUE
 
@@ -425,28 +439,14 @@ ie_collapsed <- ie_events |>
         event_tx_id = my_paste(event_tx_id),
   )
 
-se_collapsed <- se_events |>
-    dplyr::mutate(exon_key = paste(gene_id, seqnames, start, end, strand, sep = ":")) |>
-    dplyr::group_by(exon_key, event_type) |>
-    plyranges::reduce_ranges_directed(
-        n = plyranges::n(),
-        gene_id = my_paste(gene_id),
-        exon_id = my_paste(exon_id),
-        tx_id = my_paste(tx_id),
-        exon_rank = my_paste(exon_rank),
-        event_tx_id = my_paste(event_tx_id),
-  )
-
 data.frame(
-  set    = c("IE", "SE"),
-  events = c(length(ie_events), length(se_events)),
-  exons  = c(length(ie_collapsed), length(se_collapsed)),
-  max_n  = c(max(ie_collapsed$n), max(se_collapsed$n))
+  events = length(ie_events),
+  exons  = length(ie_collapsed),
+  max_n  = max(ie_collapsed$n)
 )
 
-# the sets the sequence analyses below use
+# the set the sequence analyses below use
 ie_exons <- if (collapse_exons) ie_collapsed else ie_events
-se_exons <- if (collapse_exons) se_collapsed else se_events
 ```
 
 ### IE exons per gene
@@ -484,8 +484,7 @@ as.data.frame(ie_per_gene) |>
 
 ## Sequence context around the event exons, focusing on included exons (IE)
 
-IE exons are the main set here (see *Direction of the events* above); SE exons
-are kept below as a comparison.
+IE exons are the set analysed here (see *Direction of the events* above).
 
 The analysis below uses a set of sequence-context helpers consolidated in
 `helper.R` (nucleotide-composition profiles, background exon sampling,
@@ -509,26 +508,8 @@ dim(ie_profiles$upstream)
 dim(ie_profiles$downstream)
 ```
 
-```{r plot_updownstream_ie, fig.width=8, fig.height=3.5}
-slPlotFlankProfiles(ie_profiles, exon_label = "IE")
-```
 
-### skipped exons events
-
-```{r flank_windows_se, message=FALSE}
-se_profiles <- slEventFlankProfiles(se_exons, genome = "hg38", width = 100)
-
-# rows = exons, cols = window_nucleotide (e.g. w1_A)
-dim(se_profiles$upstream)
-dim(se_profiles$downstream)
-```
-
-```{r plot_updownstream_se, fig.width=8, fig.height=3.5}
-slPlotFlankProfiles(se_profiles, exon_label = "SE")
-```
-
-
-## Background set
+### Background set
 
 We want to compare the sequence context of the events with that of a control set.
 For the control set (non-event exons), we sample as many exons as there are in
@@ -544,13 +525,21 @@ non_event <- slSampleNonEventExons(
 non_event
 ```
 
-```{r flank_windows_non_event, message=FALSE, fig.width=8, fig.height=3.5}
+```{r flank_windows_non_event, message=FALSE}
 non_event_profiles <- slEventFlankProfiles(
   non_event, genome = "hg38", width = 100
 )
 dim(non_event_profiles$upstream)
+```
 
-slPlotFlankProfiles(non_event_profiles, exon_label = "non-IE")
+The IE profiles stacked over the non-IE ones, on the same axes:
+
+```{r plot_updownstream_ie, fig.width=8, fig.height=7}
+patchwork::wrap_plots(
+  slPlotFlankProfiles(ie_profiles, exon_label = "IE"),
+  slPlotFlankProfiles(non_event_profiles, exon_label = "non-IE"),
+  ncol = 1
+)
 ```
 
 The IE and non-IE sets, one panel per nucleotide (mean ± standard error), and
@@ -620,10 +609,10 @@ round(delta_down[, order(-apply(abs(delta_down), 2, max))[1:6]], 3)
 
 ## Genes with IE events
 
-Which genes carry the IE exons, whether any of them are core essential genes,
-and a small GO enrichment. The background throughout is every gene tested for
-DTU (`dtu_res_kd`): only multi-isoform genes expressed here could have produced
-an event, so the whole genome would be the wrong reference.
+Which genes carry the IE exons, how many of them are core essential genes, and
+a small GO enrichment. The GO background is every gene tested for DTU
+(`dtu_res_kd`): only multi-isoform genes expressed here could have produced an
+event, so the whole genome would be the wrong reference.
 
 ```{r ie_genes, message=FALSE}
 library(org.Hs.eg.db)
@@ -671,68 +660,23 @@ data.frame(
   genes_tested_dtu = length(universe)
 )
 
-# the IE genes, most events first
+# the 20 IE genes with the most events (`ie_genes` has them all)
 ie_genes |>
   dplyr::arrange(dplyr::desc(n_events), symbol) |>
   dplyr::select(symbol, gene_id, n_events, n_exons, essential) |>
-  print(n = Inf)
-
-# are essential genes over-represented among IE genes, against the other
-# tested genes?
-rest_entrez <- AnnotationDbi::mapIds(
-  org.Hs.eg.db, setdiff(universe, ie_genes$ensembl), "ENTREZID", "ENSEMBL"
-)
-rest_essential <- rest_entrez %in% ceg$ENTREZ_ID
-essential_tab <- matrix(
-  c(sum(ie_genes$essential), sum(!ie_genes$essential),
-    sum(rest_essential),     sum(!rest_essential)),
-  nrow = 2, byrow = TRUE,
-  dimnames = list(c("IE genes", "other tested genes"),
-                  c("essential", "not essential"))
-)
-essential_tab
-fisher.test(essential_tab)
-```
-
-```{r plot_ie_genes_essential, fig.width=7, fig.height=2.8}
-essential_df <- as.data.frame(as.table(essential_tab)) |>
-  setNames(c("set", "status", "n")) |>
-  dplyr::group_by(set) |>
-  dplyr::mutate(frac = n / sum(n),
-                set  = sprintf("%s\n(n = %s)", set, scales::comma(sum(n)))) |>
-  dplyr::ungroup() |>
-  # IE genes on top
-  dplyr::mutate(set = factor(set, levels = rev(unique(set))),
-                label = sprintf("%s (%.1f%%)", scales::comma(n), 100 * frac))
-
-ggplot(essential_df, aes(x = frac, y = set, fill = status)) +
-  # essential share on the left
-  geom_col(position = position_stack(reverse = TRUE), width = 0.6) +
-  # essential count just right of its segment, the rest at the bar's end
-  geom_text(data = \(d) dplyr::filter(d, status == "essential"),
-            aes(label = label), hjust = 0, nudge_x = 0.01,
-            size = 3.5, colour = "grey20") +
-  geom_text(data = \(d) dplyr::filter(d, status == "not essential"),
-            aes(x = 0.99, label = label), hjust = 1,
-            size = 3.5, colour = "grey20") +
-  scale_fill_manual(values = c("essential"     = "#3A86FF",
-                               "not essential" = "grey85")) +
-  scale_x_continuous(labels = scales::percent, expand = c(0, 0)) +
-  labs(title = "Core essential genes (CEGv2) among IE genes",
-       subtitle = sprintf("Fisher's exact test p = %.3f",
-                          fisher.test(essential_tab)$p.value),
-       x = "Share of genes", y = NULL, fill = NULL) +
-  theme_bw() +
-  theme(legend.position = "top",
-        # room for the "100%" axis label at the right edge
-        plot.margin = margin(5.5, 14, 5.5, 5.5))
+  head(20)
 ```
 
 ```{r plot_ie_genes_essential_only, fig.width=7, fig.height=2}
-# the IE genes alone, without the other tested genes for comparison
-ie_essential_df <- essential_df |>
-  dplyr::filter(grepl("^IE genes", set)) |>
-  droplevels()
+# share of the IE genes that are core essential
+ie_essential_df <- data.frame(
+  set    = sprintf("IE genes\n(n = %s)", scales::comma(nrow(ie_genes))),
+  status = factor(c("essential", "not essential"),
+                  levels = c("essential", "not essential")),
+  n      = c(sum(ie_genes$essential), sum(!ie_genes$essential))
+) |>
+  dplyr::mutate(frac  = n / sum(n),
+                label = sprintf("%s (%.1f%%)", scales::comma(n), 100 * frac))
 
 ggplot(ie_essential_df, aes(x = frac, y = set, fill = status)) +
   geom_col(position = position_stack(reverse = TRUE), width = 0.6) +
@@ -784,6 +728,11 @@ carry a `_chel` suffix, so they do not overwrite the knockdown ones above.
 ## DTU testing with satuRn: iron chelation (GSE279949)
 
 Same steps, comparing the iron chelator (`CHEL`) against DMSO (`DMSO`).
+
+```{r fold_chel, include=FALSE}
+# fold the code of the chelation setup chunks, up to its event counts
+knitr::opts_chunk$set(class.source = "fold-hide")
+```
 
 ```{r filter_chel}
 se_chel <- se[, se$experiment == "chelator"]
@@ -867,10 +816,12 @@ transcripts than the knockdown.
 
 ### Direction of the events
 
-CHEL (iron chelated) is the up side and DMSO (iron present) the reference. The
-contrast is `CHEL_vs_DMSO = conditionCHEL - conditionDMSO`, so a positive
-estimate means the transcript is used more after chelation, and every event
-describes what chelated transcripts do compared with DMSO ones. As for the
+CHEL (iron chelated) is the up side and DMSO (iron present) the reference. In
+the contrast `CHEL_vs_DMSO = conditionCHEL - conditionDMSO`, CHEL is the test
+group and DMSO the reference (the subtracted term), so the estimate is CHEL
+minus DMSO: positive when a transcript is used more after chelation, negative
+when it is used more in DMSO. Every event describes what chelated transcripts do
+compared with DMSO ones. As for the
 knockdown, the level order (`levels = c("DMSO", "CHEL")`) does not change the
 fit: the contrast alone sets the direction.
 
@@ -880,20 +831,10 @@ the knockdown, CHEL here). IE events then mean the same thing in both, exons
 whose inclusion PCBP1 promotes, which is why the analyses below focus on IE as
 in the knockdown section.
 
-The source paper (PMID 41036621) supports this direction: iron chelation
-enhanced PCBP1 association with RNA (RIP-seq, Fig. 5G), rMATS after chelation
-found more cassette exons included than skipped (2714 against 2274, Fig. 1J),
-and loss of PCBP1 and PCBP2 together negated chelation-induced splicing, most
-clearly for chelation-induced inclusion (Fig. 4D-G). Chelation splicing
-correlated with PCBP1 overexpression (Fig. 3G) but not significantly with
-knockdown (Fig. 3F), so IE events should outnumber SE events here, though by
-less than for the knockdown, and the overlap with knockdown IE events may be
-small.
 
 | Event | What happens | What it suggests about low iron |
 |---|---|---|
 | IE | Exon is in chelated transcripts and absent from DMSO ones | Low iron promotes inclusion |
-| SE | Exon is skipped in chelated transcripts and present in DMSO ones | Low iron represses inclusion (promotes skipping) |
 
 ```{r preprare_exons_chel}
 # prepare exons for splicelogic
@@ -903,9 +844,6 @@ sig_exons_chel <- prepare_exons(
 ```
 
 ```{r find_events_chel}
-#find se
-se_events_chel <- sig_exons_chel |> preprocess(coef_col = "estimates") |> find_se()
-
 #find ie
 ie_events_chel <- sig_exons_chel |> preprocess(coef_col = "estimates") |> find_ie()
 
@@ -925,6 +863,10 @@ collapsed_events_chel <- events_chel |>
         exon_rank = my_paste(exon_rank),
         event_tx_id = my_paste(event_tx_id),
   )
+```
+
+```{r unfold_chel, include=FALSE}
+knitr::opts_chunk$set(class.source = NULL)
 ```
 
 ```{r barplot_event_types_chel}
@@ -963,8 +905,9 @@ ggplot(counts_chel, aes(x = event_type, y = count, fill = set)) +
 ```
 
 ```{r plot_events_by_gene_chel}
-# use splicelogic's built-in plotting function to visualize events for a specific gene
-gene_of_interest_chel <- events_chel$gene_id[1]
+# use splicelogic's built-in plotting function to visualize events for a specific gene:
+# the one with the most IE events
+gene_of_interest_chel <- names(sort(table(ie_events_chel$gene_id), decreasing = TRUE))[1]
 # filter events for the gene of interest
 events_for_gene_chel <- events_chel[events_chel$gene_id == gene_of_interest_chel]
 
@@ -985,7 +928,7 @@ for (gene in names(plots_chel)) {
 dev.off()
 ```
 
-## Collapse repeated exons
+## Collapse redundant events
 
 As for the knockdown: one row per exon for the sequence analyses below, with
 `n` the number of transcript pairs each exon came from, collapsing rows
@@ -993,9 +936,9 @@ only for the same exon (gene, chromosome, start, end, strand) and event type.
 `collapse_exons_chel <- FALSE` runs the sequence analyses on every event
 instead.
 
-```{r collapse_ie_se_chel}
+```{r collapse_ie_chel}
 # TRUE: the sequence analyses below use one row per exon. FALSE: they use every
-# IE and SE event, one row per transcript pair, as before the collapse, to
+# IE event, one row per transcript pair, as before the collapse, to
 # compare
 collapse_exons_chel <- TRUE
 
@@ -1011,28 +954,14 @@ ie_collapsed_chel <- ie_events_chel |>
         event_tx_id = my_paste(event_tx_id),
   )
 
-se_collapsed_chel <- se_events_chel |>
-    dplyr::mutate(exon_key = paste(gene_id, seqnames, start, end, strand, sep = ":")) |>
-    dplyr::group_by(exon_key, event_type) |>
-    plyranges::reduce_ranges_directed(
-        n = plyranges::n(),
-        gene_id = my_paste(gene_id),
-        exon_id = my_paste(exon_id),
-        tx_id = my_paste(tx_id),
-        exon_rank = my_paste(exon_rank),
-        event_tx_id = my_paste(event_tx_id),
-  )
-
 data.frame(
-  set    = c("IE", "SE"),
-  events = c(length(ie_events_chel), length(se_events_chel)),
-  exons  = c(length(ie_collapsed_chel), length(se_collapsed_chel)),
-  max_n  = c(max(ie_collapsed_chel$n), max(se_collapsed_chel$n))
+  events = length(ie_events_chel),
+  exons  = length(ie_collapsed_chel),
+  max_n  = max(ie_collapsed_chel$n)
 )
 
-# the sets the sequence analyses below use
+# the set the sequence analyses below use
 ie_exons_chel <- if (collapse_exons_chel) ie_collapsed_chel else ie_events_chel
-se_exons_chel <- if (collapse_exons_chel) se_collapsed_chel else se_events_chel
 ```
 
 ### IE exons per gene
@@ -1070,8 +999,8 @@ as.data.frame(ie_per_gene_chel) |>
 
 ## Sequence context around the event exons, focusing on included exons (IE)
 
-As for the knockdown, IE exons are the main set and SE exons a comparison. The
-helpers from `helper.R` are already sourced above.
+As for the knockdown, the analysis focuses on IE exons. The helpers from
+`helper.R` are already sourced above.
 
 ```{r flank_windows_ie_chel, message=FALSE}
 ie_profiles_chel <- slEventFlankProfiles(ie_exons_chel, genome = "hg38", width = 100)
@@ -1081,25 +1010,7 @@ dim(ie_profiles_chel$upstream)
 dim(ie_profiles_chel$downstream)
 ```
 
-```{r plot_updownstream_ie_chel, fig.width=8, fig.height=3.5}
-slPlotFlankProfiles(ie_profiles_chel, exon_label = "IE")
-```
-
-### skipped exons events
-
-```{r flank_windows_se_chel, message=FALSE}
-se_profiles_chel <- slEventFlankProfiles(se_exons_chel, genome = "hg38", width = 100)
-
-# rows = exons, cols = window_nucleotide (e.g. w1_A)
-dim(se_profiles_chel$upstream)
-dim(se_profiles_chel$downstream)
-```
-
-```{r plot_updownstream_se_chel, fig.width=8, fig.height=3.5}
-slPlotFlankProfiles(se_profiles_chel, exon_label = "SE")
-```
-
-## Background set
+### Background set
 
 As for the knockdown: as many non-event exons as there are in `ie_exons_chel`,
 drawn from the internal exons of transcripts with no evidence of differential
@@ -1113,13 +1024,21 @@ non_event_chel <- slSampleNonEventExons(
 non_event_chel
 ```
 
-```{r flank_windows_non_event_chel, message=FALSE, fig.width=8, fig.height=3.5}
+```{r flank_windows_non_event_chel, message=FALSE}
 non_event_profiles_chel <- slEventFlankProfiles(
   non_event_chel, genome = "hg38", width = 100
 )
 dim(non_event_profiles_chel$upstream)
+```
 
-slPlotFlankProfiles(non_event_profiles_chel, exon_label = "non-IE")
+The IE profiles stacked over the non-IE ones, on the same axes:
+
+```{r plot_updownstream_ie_chel, fig.width=8, fig.height=7}
+patchwork::wrap_plots(
+  slPlotFlankProfiles(ie_profiles_chel, exon_label = "IE"),
+  slPlotFlankProfiles(non_event_profiles_chel, exon_label = "non-IE"),
+  ncol = 1
+)
 ```
 
 The IE and non-IE sets, one panel per nucleotide (mean ± standard error), and
@@ -1130,7 +1049,8 @@ ie_vs_non_event_chel <- list(IE = ie_profiles_chel, "non-IE" = non_event_profile
 
 patchwork::wrap_plots(
   slPlotFlankProfilesByNt(ie_vs_non_event_chel),
-  slPlotFlankProfilesByNt(ie_vs_non_event_chel, difference = TRUE),
+  slPlotFlankProfilesByNt(ie_vs_non_event_chel, difference = TRUE,
+                          ylim = c(-0.2, 0.2)),
   nrow = 1
 )
 ```
@@ -1180,7 +1100,7 @@ round(delta_down_chel[, order(-apply(abs(delta_down_chel), 2, max))[1:6]], 3)
 ## Genes with IE events
 
 As for the knockdown, with every gene tested for DTU in the chelation
-comparison (`dtu_res_chel`) as the background. `strip_version()` and the CEGv2
+comparison (`dtu_res_chel`) as the GO background. `strip_version()` and the CEGv2
 list `ceg` come from the knockdown section.
 
 ```{r ie_genes_chel, message=FALSE}
@@ -1211,68 +1131,23 @@ data.frame(
   genes_tested_dtu = length(universe_chel)
 )
 
-# the IE genes, most events first
+# the 20 IE genes with the most events (`ie_genes_chel` has them all)
 ie_genes_chel |>
   dplyr::arrange(dplyr::desc(n_events), symbol) |>
   dplyr::select(symbol, gene_id, n_events, n_exons, essential) |>
-  print(n = Inf)
-
-# are essential genes over-represented among IE genes, against the other
-# tested genes?
-rest_entrez_chel <- AnnotationDbi::mapIds(
-  org.Hs.eg.db, setdiff(universe_chel, ie_genes_chel$ensembl), "ENTREZID", "ENSEMBL"
-)
-rest_essential_chel <- rest_entrez_chel %in% ceg$ENTREZ_ID
-essential_tab_chel <- matrix(
-  c(sum(ie_genes_chel$essential), sum(!ie_genes_chel$essential),
-    sum(rest_essential_chel),     sum(!rest_essential_chel)),
-  nrow = 2, byrow = TRUE,
-  dimnames = list(c("IE genes", "other tested genes"),
-                  c("essential", "not essential"))
-)
-essential_tab_chel
-fisher.test(essential_tab_chel)
-```
-
-```{r plot_ie_genes_essential_chel, fig.width=7, fig.height=2.8}
-essential_df_chel <- as.data.frame(as.table(essential_tab_chel)) |>
-  setNames(c("set", "status", "n")) |>
-  dplyr::group_by(set) |>
-  dplyr::mutate(frac = n / sum(n),
-                set  = sprintf("%s\n(n = %s)", set, scales::comma(sum(n)))) |>
-  dplyr::ungroup() |>
-  # IE genes on top
-  dplyr::mutate(set = factor(set, levels = rev(unique(set))),
-                label = sprintf("%s (%.1f%%)", scales::comma(n), 100 * frac))
-
-ggplot(essential_df_chel, aes(x = frac, y = set, fill = status)) +
-  # essential share on the left
-  geom_col(position = position_stack(reverse = TRUE), width = 0.6) +
-  # essential count just right of its segment, the rest at the bar's end
-  geom_text(data = \(d) dplyr::filter(d, status == "essential"),
-            aes(label = label), hjust = 0, nudge_x = 0.01,
-            size = 3.5, colour = "grey20") +
-  geom_text(data = \(d) dplyr::filter(d, status == "not essential"),
-            aes(x = 0.99, label = label), hjust = 1,
-            size = 3.5, colour = "grey20") +
-  scale_fill_manual(values = c("essential"     = "#3A86FF",
-                               "not essential" = "grey85")) +
-  scale_x_continuous(labels = scales::percent, expand = c(0, 0)) +
-  labs(title = "Core essential genes (CEGv2) among IE genes, iron chelation",
-       subtitle = sprintf("Fisher's exact test p = %.3f",
-                          fisher.test(essential_tab_chel)$p.value),
-       x = "Share of genes", y = NULL, fill = NULL) +
-  theme_bw() +
-  theme(legend.position = "top",
-        # room for the "100%" axis label at the right edge
-        plot.margin = margin(5.5, 14, 5.5, 5.5))
+  head(20)
 ```
 
 ```{r plot_ie_genes_essential_only_chel, fig.width=7, fig.height=2}
-# the IE genes alone, without the other tested genes for comparison
-ie_essential_df_chel <- essential_df_chel |>
-  dplyr::filter(grepl("^IE genes", set)) |>
-  droplevels()
+# share of the IE genes that are core essential
+ie_essential_df_chel <- data.frame(
+  set    = sprintf("IE genes\n(n = %s)", scales::comma(nrow(ie_genes_chel))),
+  status = factor(c("essential", "not essential"),
+                  levels = c("essential", "not essential")),
+  n      = c(sum(ie_genes_chel$essential), sum(!ie_genes_chel$essential))
+) |>
+  dplyr::mutate(frac  = n / sum(n),
+                label = sprintf("%s (%.1f%%)", scales::comma(n), 100 * frac))
 
 ggplot(ie_essential_df_chel, aes(x = frac, y = set, fill = status)) +
   geom_col(position = position_stack(reverse = TRUE), width = 0.6) +
@@ -1313,4 +1188,145 @@ enrichplot::dotplot(ie_go_chel, showCategory = 10) +
   labs(title = "GO biological process, IE genes, iron chelation",
        subtitle = sprintf("%d term(s) at p.adjust < 0.05",
                           sum(ie_go_chel@result$p.adjust < 0.05)))
+```
+
+# Knockdown vs chelation
+
+## IE events in both comparisons
+
+In both comparisons the up side is the condition with more PCBP1 activity (WT
+for the knockdown, CHEL for the chelation), so an IE event means the same thing
+in both: an exon whose inclusion goes with more PCBP1 activity. If chelation
+acts through PCBP1, the IE events of the two comparisons should overlap.
+
+The overlap is counted at three levels: genes, transcripts (only those that
+include the IE exon, `tx_id`, not the partner transcripts that skip it) and
+exons (`exon_key`, the gene and exact position, from the collapsed sets). Both
+comparisons use the same annotation (GENCODE v43), so the identifiers match.
+Chelation has many more IE events than the knockdown, so the telling number is
+the share of the knockdown set that is also found after chelation
+(`kd_in_chel`).
+
+```{r ie_overlap}
+ie_sets <- list(
+  genes = list(
+    kd   = unique(ie_events$gene_id),
+    chel = unique(ie_events_chel$gene_id)
+  ),
+  transcripts = list(
+    kd   = unique(ie_events$tx_id),
+    chel = unique(ie_events_chel$tx_id)
+  ),
+  exons = list(
+    kd   = unique(ie_collapsed$exon_key),
+    chel = unique(ie_collapsed_chel$exon_key)
+  )
+)
+
+ie_overlap <- do.call(rbind, lapply(names(ie_sets), function(level) {
+  kd     <- ie_sets[[level]]$kd
+  chel   <- ie_sets[[level]]$chel
+  shared <- intersect(kd, chel)
+  data.frame(
+    level      = level,
+    knockdown  = length(kd),
+    chelation  = length(chel),
+    shared     = length(shared),
+    kd_in_chel = round(length(shared) / length(kd), 3),
+    chel_in_kd = round(length(shared) / length(chel), 3),
+    jaccard    = round(length(shared) / length(union(kd, chel)), 3)
+  )
+}))
+ie_overlap
+```
+
+UpSet plots for genes and transcripts: the bars on top are the knockdown-only,
+shared and chelation-only sets, the dots below show which comparison each bar
+belongs to, and the bars on the left are the size of each IE set. The shared set
+is highlighted.
+
+```{r plot_ie_overlap, fig.width=6, fig.height=4.5, out.width="50%", fig.show="hold", warning=FALSE}
+# one UpSet plot per level; out.width = 50% puts the two side by side
+for (level in c("genes", "transcripts")) {
+  print(UpSetR::upset(
+    UpSetR::fromList(list(Knockdown = ie_sets[[level]]$kd,
+                          Chelation = ie_sets[[level]]$chel)),
+    sets            = c("Chelation", "Knockdown"),
+    keep.order      = TRUE,
+    order.by        = "freq",
+    main.bar.color  = "grey40",
+    sets.bar.color  = "grey40",
+    queries         = list(list(query  = UpSetR::intersects,
+                                params = list("Knockdown", "Chelation"),
+                                color  = "#3A86FF", active = TRUE)),
+    mainbar.y.label = paste("IE", level),
+    sets.x.label    = "IE set size",
+    text.scale      = 1.3
+  ))
+  grid::grid.text(paste("IE", level), x = 0.02, y = 0.98,
+                  just = c("left", "top"),
+                  gp = grid::gpar(fontsize = 14, fontface = "bold"))
+}
+```
+
+The genes and transcripts with IE events in both comparisons: the shared genes
+with their full name and number of IE events in each comparison, and the
+transcripts that include an IE exon in both.
+
+```{r ie_overlap_names}
+shared_genes <- intersect(ie_sets$genes$kd, ie_sets$genes$chel)
+
+ie_genes |>
+  dplyr::filter(gene_id %in% shared_genes) |>
+  dplyr::select(symbol, gene_id, n_events_kd = n_events) |>
+  dplyr::left_join(
+    dplyr::select(ie_genes_chel, gene_id, n_events_chel = n_events),
+    by = "gene_id"
+  ) |>
+  dplyr::mutate(
+    name = AnnotationDbi::mapIds(org.Hs.eg.db, strip_version(gene_id),
+                                 "GENENAME", "ENSEMBL"),
+    .after = gene_id
+  ) |>
+  dplyr::arrange(symbol) |>
+  knitr::kable()
+
+tibble::tibble(
+  tx_id = intersect(ie_sets$transcripts$kd, ie_sets$transcripts$chel)
+) |>
+  dplyr::left_join(
+    dplyr::distinct(tibble::tibble(tx_id   = ie_events$tx_id,
+                                   gene_id = ie_events$gene_id)),
+    by = "tx_id"
+  ) |>
+  dplyr::left_join(dplyr::select(ie_genes, gene_id, symbol), by = "gene_id") |>
+  dplyr::select(symbol, gene_id, tx_id) |>
+  dplyr::arrange(symbol, tx_id) |>
+  knitr::kable()
+```
+
+GO annotation of the shared genes, from org.Hs.eg.db with the term names from
+GO.db: one row per gene and ontology (BP biological process, MF molecular
+function, CC cellular component).
+
+```{r ie_overlap_go, message=FALSE}
+shared_go <- AnnotationDbi::select(
+  org.Hs.eg.db, keys = strip_version(shared_genes),
+  columns = c("SYMBOL", "GO", "ONTOLOGY"), keytype = "ENSEMBL"
+) |>
+  dplyr::filter(!is.na(GO)) |>
+  dplyr::distinct(SYMBOL, GO, ONTOLOGY)
+
+go_terms <- AnnotationDbi::mapIds(GO.db::GO.db, unique(shared_go$GO),
+                                  "TERM", "GOID")
+shared_go$term <- go_terms[shared_go$GO]
+
+shared_go |>
+  dplyr::mutate(ONTOLOGY = factor(ONTOLOGY, levels = c("BP", "MF", "CC"))) |>
+  dplyr::group_by(symbol = SYMBOL, ontology = ONTOLOGY) |>
+  dplyr::summarise(n_terms = dplyr::n_distinct(term),
+                   terms   = paste(sort(unique(term)), collapse = "; "),
+                   .groups = "drop") |>
+  dplyr::arrange(symbol, ontology) |>
+  knitr::kable()
 ```
