@@ -1,4 +1,7 @@
 library(here)
+# splicelogic devel, loaded from source: clone the repo next to this one
+#   git clone -b devel https://github.com/thelovelab/splicelogic.git ../splicelogic
+# then load it with devtools (install.packages("devtools") if needed)
 devtools::load_all(here("../splicelogic"))
 library(BSgenome.Hsapiens.NCBI.GRCh38)
 library(plyranges)
