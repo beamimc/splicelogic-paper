@@ -48,6 +48,9 @@ library(limma)
 library(tibble)
 library(tximeta)
 library(here)
+# splicelogic devel, loaded from source: clone the repo next to this one
+#   git clone -b devel https://github.com/thelovelab/splicelogic.git ../splicelogic
+# then load it with devtools (install.packages("devtools") if needed)
 devtools::load_all(here("../splicelogic"))
 ```
 
@@ -1329,4 +1332,13 @@ shared_go |>
                    .groups = "drop") |>
   dplyr::arrange(symbol, ontology) |>
   knitr::kable()
+```
+
+## Session info
+
+The R and package versions (satuRn, splicelogic, Bioconductor, ...) this
+report was knitted with.
+
+```{r session_info}
+sessionInfo()
 ```

@@ -16,6 +16,9 @@ library(ggplot2)
 library(tibble)
 library(here)
 library(plyxp)
+# splicelogic devel, loaded from source: clone the repo next to this one
+#   git clone -b devel https://github.com/thelovelab/splicelogic.git ../splicelogic
+# then load it with devtools (install.packages("devtools") if needed)
 devtools::load_all(here("../splicelogic"))
 ```
 
@@ -60,6 +63,33 @@ rowData(se_bambu)$direction <- ifelse(
 # most `tie` rows are transcripts at zero in both groups
 table(rowData(se_bambu)$direction)
 table(rowData(se_bambu)$direction[rowMeans(cpm) > 1])
+```
+
+How many samples each donor contributes to each condition.
+
+```{r samples_per_donor}
+samples_per_donor <- as.data.frame(colData(se_bambu)) |>
+  dplyr::count(donor, condition) |>
+  tidyr::pivot_wider(names_from = condition, values_from = n, values_fill = 0) |>
+  dplyr::mutate(total = WT + KD)
+
+# with a total row
+dplyr::bind_rows(
+  samples_per_donor,
+  dplyr::summarise(samples_per_donor, donor = "total",
+                   dplyr::across(c(KD, WT, total), sum))
+)
+```
+
+What the bambu objects record about the run. Neither stores the bambu
+version, and bambu builds its `SummarizedExperiment` itself, so tximeta is
+not involved. The discovery object keeps the novel discovery rate (NDR)
+threshold bambu used.
+
+```{r provenance}
+names(metadata(se_bambu))
+names(metadata(bdisc))
+metadata(bdisc)$NDRthreshold
 ```
 
 A quick look at the novel genes' expression, to see how much signal there is.
@@ -207,6 +237,9 @@ length(intersect(unique(up$gene_id), unique(down$gene_id)))
 sl_exons <- prepare_exons_by_partition(up, down) |>
   preprocess(coef_col = "estimate")
 
+# save sl_exons 
+saveRDS(sl_exons, here("workflows", "data", "sl_exons_bambu.rds"))
+
 events_bambu <- find_all_events(sl_exons)
 ```
 
@@ -270,40 +303,98 @@ ggplot(counts, aes(x = event_type, y = count, fill = set)) +
   theme_bw()
 ```
 
-```{r pie_collapsed_event_types, fig.width=6, fig.height=4.5}
-# event types in the package's order, with the package's colours, so each type
-# matches its colour in plot_transcripts()
+```{r bar_collapsed_event_types, fig.width=6, fig.height=4.5}
+# Collapsed events by type, split into two groups: the transcript ends (ATSS,
+# ATES) and the internal splicing events (everything else). One panel per
+# group, bars in the package's event colours so each type matches its colour
+# in plot_transcripts(), sorted by count within the group.
 type_colors <- event_palette()
-type_order  <- names(type_colors)
+end_types   <- c("atss", "ates")
 
-pie_counts <- collapsed_event_counts |>
+bar_counts <- collapsed_event_counts |>
   dplyr::mutate(
-    event_type = factor(event_type, levels = type_order),
-    pct        = 100 * count / sum(count),
-    # slices under 5% are too thin to label; the legend carries them
-    label      = ifelse(pct >= 5,
-                        sprintf("%s\n%.1f%%", toupper(event_type), pct), "")
+    pct   = 100 * count / sum(count),
+    group = ifelse(event_type %in% end_types, "Transcript ends", "Internal splicing"),
+    label = sprintf("%d (%.1f%%)", count, pct)
   )
 
-legend_labels <- with(pie_counts, setNames(
-  sprintf("%s  %d (%.1f%%)", toupper(event_type), count, pct),
-  event_type
-))
+# one panel per group, its height proportional to the number of types in it
+plot_group <- function(grp, x_max, show_x) {
+  d <- bar_counts |>
+    dplyr::filter(group == grp) |>
+    dplyr::arrange(count) |>
+    dplyr::mutate(type = factor(toupper(event_type), levels = toupper(event_type)))
+  ggplot(d, aes(count, type, fill = event_type)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = label), hjust = -0.1, colour = "grey20", size = 3) +
+    scale_fill_manual(values = type_colors, guide = "none") +
+    scale_x_continuous(limits = c(0, x_max), expand = expansion(mult = c(0, 0.02))) +
+    labs(title = sprintf("%s: %d (%.1f%%)", grp, sum(d$count), sum(d$pct)),
+         x = if (show_x) "Events" else NULL, y = NULL) +
+    theme_bw() +
+    theme(plot.title = element_text(face = "bold", size = 10),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.text.x = if (show_x) element_text() else element_blank(),
+          axis.ticks.x = if (show_x) element_line() else element_blank())
+}
 
-ggplot(pie_counts, aes(x = 1, y = count, fill = event_type)) +
-  geom_col(width = 1, colour = "white", linewidth = 0.5) +
-  # labels just outside the pie, at each slice's midpoint
-  geom_text(aes(x = 1.75, label = label, group = event_type),
-            position = position_stack(vjust = 0.5),
-            size = 3.2, lineheight = 0.9, colour = "grey20") +
-  # clockwise from 12 o'clock, in the same order as the legend
-  coord_polar(theta = "y", direction = -1) +
-  scale_x_continuous(limits = c(0.5, 2)) +
-  scale_fill_manual(values = type_colors, labels = legend_labels) +
-  labs(title = "Collapsed novel-transcript events by type",
-       subtitle = sprintf("n = %s", scales::comma(sum(pie_counts$count))),
-       fill = NULL) +
-  theme_void()
+n_types <- table(bar_counts$group)
+
+# the two panels stacked, with the overall title; the shared x axis runs past
+# the longest bar to leave room for its count label
+x_max <- max(bar_counts$count) * 1.35
+patchwork::wrap_plots(
+  plot_group("Transcript ends", x_max, show_x = FALSE),
+  plot_group("Internal splicing", x_max, show_x = TRUE),
+  ncol = 1,
+  heights = c(n_types[["Transcript ends"]], n_types[["Internal splicing"]])
+) +
+  patchwork::plot_annotation(
+    title = "Collapsed novel-transcript events by type",
+    subtitle = sprintf("n = %s", scales::comma(sum(bar_counts$count)))
+  )
+```
+
+A summary of the novel transcripts before and after the expression filter,
+the genes they fall in, and the events they give.
+
+```{r novel_summary_table}
+# transcript annotation before the filter (se_bambu above is the filtered one)
+rd_unfilt <- as.data.frame(rowData(readRDS(here("workflows", "data", "bambu_quant_se.rds"))))
+rd_filt   <- as.data.frame(rowData(se_bambu))
+
+tx_summary <- function(rd) {
+  novel <- rd[rd$novelTranscript, ]
+  c(novel_tx          = nrow(novel),
+    novel_tx_known    = sum(!novel$novelGene),
+    novel_tx_new_gene = sum(novel$novelGene),
+    known_genes       = dplyr::n_distinct(novel$GENEID[!novel$novelGene]),
+    new_genes         = dplyr::n_distinct(novel$GENEID[novel$novelGene]))
+}
+before <- tx_summary(rd_unfilt)
+after  <- tx_summary(rd_filt)
+
+# genes with a novel transcript and an annotated partner that passed the filter
+compared_genes <- length(intersect(unique(up$gene_id), unique(down$gene_id)))
+
+tibble::tibble(
+  what = c("novel transcripts",
+           "  at annotated genes (kept)",
+           "  at new genes (dropped)",
+           "annotated genes with a novel transcript",
+           "  with an annotated partner after the filter",
+           "new genes",
+           "events (one row per transcript pair)",
+           "distinct events (collapsed)"),
+  before_filter = c(before[["novel_tx"]], before[["novel_tx_known"]],
+                    before[["novel_tx_new_gene"]], before[["known_genes"]],
+                    NA, before[["new_genes"]], NA, NA),
+  after_filter  = c(after[["novel_tx"]], after[["novel_tx_known"]],
+                    after[["novel_tx_new_gene"]], after[["known_genes"]],
+                    compared_genes, after[["new_genes"]],
+                    length(events_bambu), length(collapsed_events))
+)
 ```
 
 ## Per-transcript annotation for the plots
@@ -753,3 +844,12 @@ data.frame(
 )
 ```
 
+
+## Session info
+
+The R and package versions (satuRn, splicelogic, Bioconductor, ...) this
+report was knitted with.
+
+```{r session_info}
+sessionInfo()
+```

@@ -191,51 +191,75 @@ slEventFlankProfiles <- function(events, genome, width = 100,
                           xmin = nwin + 0.5, xmax = nwin + gap + 0.5,
                           ymin = -Inf, ymax = Inf, fill = "white"),
         ggplot2::annotate("rect",
-                          xmin = exon_x - 0.2, xmax = exon_x + 0.2,
+                          xmin = exon_x - gap / 8, xmax = exon_x + gap / 8,
                           ymin = -Inf, ymax = Inf, fill = "grey75")
     )
 }
 
-# Shared look of the flank plots: no axis lines or ticks, only light
-# horizontal gridlines.
-.slFlankTheme <- function() {
-    ggplot2::theme_classic() +
+# A black x-axis line along the bottom of the panel under each flank, stopping
+# at the edges of the exon gap. `facet` is a data frame of the facet values of
+# the panels that should get it (the bottom row); NULL draws it in every panel.
+# Drawn at y = -Inf, so the plot needs clip = "off" to show its full width.
+.slFlankXLine <- function(nwin, gap, facet = NULL, linewidth = 0.5) {
+    seg <- data.frame(x    = c(-Inf, nwin + gap + 0.5),
+                      xend = c(nwin + 0.5, Inf))
+    if (!is.null(facet)) {
+        seg <- merge(seg, facet, by = NULL)
+    }
+    ggplot2::geom_segment(
+        data = seg,
+        ggplot2::aes(x = .data$x, xend = .data$xend, y = -Inf, yend = -Inf),
+        inherit.aes = FALSE, colour = "black", linewidth = linewidth
+    )
+}
+
+# Shared look of the flank plots: no axis lines or ticks (the x-axis line is
+# drawn per intron by .slFlankXLine(), so it breaks at the exon), black x-axis
+# labels and light horizontal gridlines.
+.slFlankTheme <- function(base_size = 11) {
+    ggplot2::theme_classic(base_size = base_size) +
         ggplot2::theme(
             legend.position    = "top",
             axis.line          = ggplot2::element_blank(),
             axis.ticks         = ggplot2::element_blank(),
             axis.text          = ggplot2::element_text(colour = "grey40"),
-            panel.grid.major.y = ggplot2::element_line(colour = "grey85",
-                                                       linewidth = 0.3)
+            axis.text.x        = ggplot2::element_text(colour = "black"),
+            # gridlines and legend keys scale with the text, so a plot drawn
+            # at half the base size keeps its proportions
+            panel.grid.major.y = ggplot2::element_line(
+                colour = "grey85", linewidth = 0.3 * base_size / 11
+            ),
+            legend.key.size    = ggplot2::unit(1.2 * base_size, "pt")
         )
 }
 
 #' Plot the nucleotide composition flanking a set of exons
 #'
-#' Mean nucleotide fraction per window, upstream and downstream panels split by
-#' a thin bar standing in for the exon itself, with standard-error bars.
+#' Mean nucleotide fraction per window, with a ribbon for the standard error,
+#' upstream and downstream of the exon on one axis, split by a grey bar
+#' standing in for the exon itself. Styled like [slPlotFlankProfilesByNt()].
 #'
 #' @param profiles Either the list returned by [slEventFlankProfiles()] or the
 #'   upstream matrix, with the downstream matrix passed as `downstream`.
 #' @param downstream Downstream matrix, when `profiles` is a matrix.
-#' @param exon_label Label under the exon bar, e.g. `"SE"`.
-#' @param exon_label_size Text size of `exon_label`, in mm as for
-#'   [ggplot2::geom_text()].
+#' @param exon_label Name of the exon set (e.g. `"SE"`), shown as the plot's
+#'   bold title at the top left.
 #' @param width,step Flank width (bp) and distance (bp) between consecutive
 #'   window starts. Taken from the attributes of `profiles` when available.
 #' @param gap Space between the two flanks, in window units. The exon bar sits
 #'   in the middle of it.
 #' @param break_every Spacing (bp) of the labelled x-axis positions.
 #' @param ylim y-axis range. The means use every window, but the panel is not
-#'   clipped (the exon label is drawn below it), so a mean outside `ylim` is
-#'   drawn past the panel edge.
+#'   clipped (so the x-axis line shows at full width), so a mean outside
+#'   `ylim` is drawn past the panel edge.
 #' @param hlines y-axis breaks, each with a light gridline. `NULL` for the
 #'   default breaks.
 #' @param palette Named colour vector for the four nucleotides.
+#' @param base_size Base font size.
+#' @param linewidth Width of the profile lines.
 #' @return A `ggplot` object.
 slPlotFlankProfiles <- function(profiles, downstream = NULL,
                                 exon_label      = "exon",
-                                exon_label_size = 5,
                                 width           = NULL,
                                 step            = NULL,
                                 gap             = 4,
@@ -246,7 +270,9 @@ slPlotFlankProfiles <- function(profiles, downstream = NULL,
                                 palette         = c(A = "#3A86FF",
                                                     C = "#F0545C",
                                                     G = "#2EB67D",
-                                                    U = "#F2B705")) {
+                                                    U = "#F2B705"),
+                                base_size       = 14,
+                                linewidth       = 1.1) {
 
     if (is.list(profiles) && !is.matrix(profiles)) {
         if (is.null(width)) width <- attr(profiles, "width")
@@ -285,46 +311,46 @@ slPlotFlankProfiles <- function(profiles, downstream = NULL,
     up$x   <- up$win_idx
     down$x <- down$win_idx + nwin + gap
     df     <- dplyr::bind_rows(up, down)
-    # the exon label is left off the axis, which has one text size for every
-    # label, and drawn under the exon bar as its own, larger text
-    ax     <- .slFlankXAxis(nwin, gap, width, step, break_every, "")
+    ax     <- .slFlankXAxis(nwin, gap, width, step, break_every, "exon")
 
     ggplot2::ggplot(df, ggplot2::aes(
-        x = .data$x, y = .data$value, color = .data$nt,
+        x = .data$x, y = .data$value,
         group = interaction(.data$set, .data$nt)
     )) +
-        ggplot2::stat_summary(fun      = mean,    geom = "line",
-                              linewidth = 0.8) +
-        ggplot2::stat_summary(fun.data = ggplot2::mean_se, geom = "errorbar",
-                              width = 0.2) +
+        # mean +/- s.e. as a ribbon, then the mean line on top
+        ggplot2::stat_summary(ggplot2::aes(fill = .data$nt),
+                              fun.data = ggplot2::mean_se,
+                              geom = "ribbon", alpha = 0.25, colour = NA) +
+        ggplot2::stat_summary(ggplot2::aes(colour = .data$nt),
+                              fun = mean, geom = "line",
+                              linewidth = linewidth) +
         .slFlankExonBar(nwin, gap, ax$exon_x) +
-        # placed in points below the panel, under the two lines of axis text
-        # (bp, then splice sites), so it clears the splice-site labels
-        ggplot2::annotation_custom(
-            grid::textGrob(
-                exon_label, y = grid::unit(-22, "pt"), vjust = 1,
-                gp = grid::gpar(fontsize = exon_label_size * ggplot2::.pt,
-                                fontface = "bold", col = "grey20")
-            ),
-            xmin = ax$exon_x, xmax = ax$exon_x, ymin = -Inf, ymax = -Inf
-        ) +
-        ggplot2::scale_color_manual(values = palette) +
+        .slFlankXLine(nwin, gap, linewidth = 0.5 * base_size / 14) +
+        # one legend for line and ribbon (same name and values)
+        ggplot2::scale_colour_manual(values = palette, name = "Nucleotide") +
+        ggplot2::scale_fill_manual(values = palette, name = "Nucleotide") +
         ggplot2::scale_x_continuous(breaks = ax$breaks, labels = ax$labels) +
         ggplot2::scale_y_continuous(
             breaks = if (length(hlines) > 0L) hlines else ggplot2::waiver(),
-            expand = ggplot2::expansion(mult = 0.02)
+            # no padding below, so the x-axis line sits exactly on ylim[1]
+            expand = ggplot2::expansion(mult = c(0, 0.02))
         ) +
         # limited rather than filtered, so the means use every window; not
-        # clipped, so the exon label can sit below the panel
+        # clipped, so the x-axis line at the panel edge shows at full width
         ggplot2::coord_cartesian(ylim = ylim, clip = "off") +
-        ggplot2::labs(x = "Relative position in intronic sequence (nt)",
-                      y = "Nucleotide fraction",
-                      color = "Nucleotide") +
-        .slFlankTheme() +
-        # room for the exon label between the axis text and the axis title
-        ggplot2::theme(axis.title.x = ggplot2::element_text(
-            margin = ggplot2::margin(t = exon_label_size * ggplot2::.pt + 6)
-        ))
+        ggplot2::labs(title = exon_label,
+                      x = "Relative position in intronic sequence (nt)",
+                      y = "Nucleotide fraction") +
+        .slFlankTheme(base_size) +
+        ggplot2::theme(
+            legend.key.width = ggplot2::unit(1.5, "cm"),
+            legend.text      = ggplot2::element_text(size = base_size),
+            # the set name as a bold title at the top left, like the
+            # nucleotide titles of slPlotFlankProfilesByNt()
+            plot.title       = ggplot2::element_text(face = "bold",
+                                                     size = base_size * 1.2,
+                                                     hjust = 0)
+        )
 }
 
 #' Compare the flanking nucleotide composition of several exon sets
@@ -351,11 +377,14 @@ slPlotFlankProfiles <- function(profiles, downstream = NULL,
 #' @param ylim y-axis range shared by every panel. `NULL` (the default) gives
 #'   each nucleotide its own range, so small differences between sets stay
 #'   visible, or with `difference = TRUE` one range symmetric around zero.
-#' @param ncol Number of panel columns.
+#' @param ncol Number of panel columns. The default 1 stacks the four
+#'   nucleotides in 4 rows.
 #' @param palette Named colour vector for the four nucleotides, used for the
 #'   first set.
 #' @param background Colour for every set after the first.
 #' @param linetypes Line types for the sets, named by set or in set order.
+#' @param base_size Base font size.
+#' @param linewidth Width of the profile lines.
 #' @return A `ggplot` object.
 slPlotFlankProfilesByNt <- function(profiles,
                                     difference  = FALSE,
@@ -370,7 +399,9 @@ slPlotFlankProfilesByNt <- function(profiles,
                                                     U = "#F2B705"),
                                     background  = "grey50",
                                     linetypes   = c("solid", "dashed",
-                                                    "dotted", "dotdash")) {
+                                                    "dotted", "dotdash"),
+                                    base_size   = 14,
+                                    linewidth   = 1.1) {
 
     if (!is.list(profiles) || is.matrix(profiles) ||
         is.null(names(profiles)) || any(names(profiles) == "")) {
@@ -460,7 +491,7 @@ slPlotFlankProfilesByNt <- function(profiles,
                                               fill = .data$nt),
                                  alpha = 0.3) +
             ggplot2::geom_line(ggplot2::aes(colour = .data$nt),
-                               linewidth = 0.8) +
+                               linewidth = linewidth) +
             ggplot2::scale_colour_manual(values = palette, guide = "none") +
             ggplot2::scale_fill_manual(values = palette, guide = "none") +
             ggplot2::scale_y_continuous(
@@ -485,7 +516,7 @@ slPlotFlankProfilesByNt <- function(profiles,
             ggplot2::stat_summary(ggplot2::aes(colour   = .data$hue,
                                                linetype = .data$set),
                                   fun = mean, geom = "line",
-                                  linewidth = 0.8) +
+                                  linewidth = linewidth) +
             # the panel titles already name the nucleotide, so only the sets
             # get a legend
             ggplot2::scale_colour_manual(values = hues, guide = "none") +
@@ -496,8 +527,10 @@ slPlotFlankProfilesByNt <- function(profiles,
                     colour = c("grey20", rep(background, length(sets) - 1L))
                 ))
             ) +
-            # little padding above and below, so the profiles fill the panel,
-            # and two or three gridlines per panel at round values
+            # every panel starts at 0, with no padding below, so the x-axis
+            # line sits exactly on 0; a little padding above, and two or three
+            # gridlines per panel at round values
+            ggplot2::expand_limits(y = 0) +
             ggplot2::scale_y_continuous(
                 breaks = function(l) {
                     b <- pretty(l, n = 4)
@@ -505,31 +538,42 @@ slPlotFlankProfilesByNt <- function(profiles,
                     if (length(b) > 3L) b <- b[seq(1L, length(b), by = 2L)]
                     b
                 },
-                expand = ggplot2::expansion(mult = 0.02)
+                expand = ggplot2::expansion(mult = c(0, 0.02))
             ) +
             ggplot2::labs(y = "Nucleotide fraction", linetype = NULL)
     }
 
+    # the panels with no panel below them carry the x axis, so the line too
+    nts    <- sort(unique(df$nt))
+    bottom <- nts[seq_along(nts) + ncol > length(nts)]
+
     p +
         .slFlankExonBar(nwin, gap, ax$exon_x) +
+        .slFlankXLine(nwin, gap, facet = data.frame(nt = bottom),
+                      linewidth = 0.5 * base_size / 14) +
         ggplot2::facet_wrap(
-            ~ nt, ncol = ncol, strip.position = "left",
+            ~ nt, ncol = ncol,
             scales = if (is.null(ylim)) "free_y" else "fixed"
         ) +
         ggplot2::scale_x_continuous(breaks = ax$breaks, labels = ax$labels) +
-        # clipped rather than filtered, so the means use every window
-        ggplot2::coord_cartesian(ylim = ylim) +
+        # limited rather than filtered, so the means use every window; not
+        # clipped (unless a ylim could cut the data), so the x-axis line at the
+        # panel edge shows at full width
+        ggplot2::coord_cartesian(ylim = ylim,
+                                 clip = if (is.null(ylim)) "off" else "on") +
         ggplot2::labs(x = "Relative position in intronic sequence (nt)") +
-        .slFlankTheme() +
+        .slFlankTheme(base_size) +
         ggplot2::theme(
             legend.key.width   = ggplot2::unit(1.5, "cm"),
+            legend.text        = ggplot2::element_text(size = base_size),
+            # the nucleotide as a bold title at the top left of each panel
             strip.background   = ggplot2::element_blank(),
-            strip.placement    = "outside",
-            strip.text.y.left  = ggplot2::element_text(angle = 0,
-                                                       face = "bold",
-                                                       size = 14),
+            strip.text         = ggplot2::element_text(face = "bold",
+                                                       size = base_size * 1.2,
+                                                       hjust = 0),
             # room between the panels so each exon bar is separate
-            panel.spacing.y    = ggplot2::unit(1, "lines")
+            panel.spacing.y    = ggplot2::unit(1, "lines"),
+            panel.spacing.x    = ggplot2::unit(2, "lines")
         )
 }
 
