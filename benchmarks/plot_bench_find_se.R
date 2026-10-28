@@ -12,6 +12,9 @@ panel_labels <- c(
   n_pos_per_gene = "Pos tx / gene"
 )
 
+# same blue as slPlotFlankProfilesByNt() (the A nucleotide colour)
+line_col <- "#3A86FF"
+
 plot_data <- bind_rows(
   results |>
     filter(event_ratio == BL$event_ratio, n_pos_per_gene == BL$n_pos_per_gene) |>
@@ -25,30 +28,70 @@ plot_data <- bind_rows(
 ) |>
   mutate(
     focal_dim = factor(focal_dim, levels = names(panel_labels)),
-    median_ms = median * 1000
-  )
+    mean_ms   = mean_s * 1000,
+    se_ms     = (sd_s * 1000) / sqrt(n_itr),
+    lo        = mean_ms - se_ms,
+    hi        = mean_ms + se_ms
+  ) |>
+  # thin the Pos tx / gene panel to 4 points across the swept range
+  filter(!(focal_dim == "n_pos_per_gene" &
+             !focal_value %in% c(1, 4, 7, 10))) |>
+  # figure 1 shows the default type only
+  filter(type == "over")
 
-p <- ggplot(plot_data, aes(x = focal_value, y = median_ms, color = type)) +
-  geom_line() +
-  geom_point(size = 2) +
+# y axis from just below the lowest error bar (to the 25 ms below it, so no
+# empty band) to the highest error bar, labelled every 25 ms
+y_step <- 25
+y_lim <- c(floor(min(plot_data$lo) / 25) * 25, max(plot_data$hi))
+y_breaks <- seq(ceiling(y_lim[1] / y_step) * y_step, y_lim[2], by = y_step)
+
+p <- ggplot(plot_data, aes(focal_value, mean_ms)) +
+  # spread across the iterations (gc iterations kept, see bench_find_se.R):
+  # mean +/- SE, as error bars
+  geom_linerange(aes(ymin = lo, ymax = hi), linewidth = 0.6,
+                 colour = line_col) +
+  # as thick as the lines of the flank profiles (slPlotFlankProfilesByNt())
+  geom_line(linewidth = 1.1, colour = line_col) +
+  geom_point(size = 2, colour = line_col) +
   facet_wrap(
     ~ focal_dim,
     scales = "free_x",
+    strip.position = "bottom",
     labeller = labeller(focal_dim = panel_labels)
   ) +
-  scale_color_brewer(palette = "Set2", name = "Match type") +
-  labs(
-    title    = "find_se() runtime by gene count and event density",
-    subtitle = sprintf("FX: %d exons/tx; BL: %d genes, %.0f%% event ratio, %d pos tx/gene",
-                       cfg$fixed_n_exons_per_tx,
-                       BL$n_genes, BL$event_ratio * 100, BL$n_pos_per_gene),
-    x = NULL,
-    y = "Median runtime (ms)"
+  # 1000 -> 1k, 2000 -> 2k (the Genes panel); small values stay as they are
+  scale_x_continuous(
+    # about five breaks per panel, few enough that the labels do not run
+    # together when the plot is drawn in figure 1
+    breaks = \(l) pretty(l, n = 5),
+    labels = \(x) ifelse(x >= 1000, paste0(x / 1000, "k"), x)
   ) +
-  theme_minimal(base_size = 12) +
-  theme(panel.grid.minor = element_blank())
+  scale_y_continuous(breaks = y_breaks, limits = y_lim) +
+  labs(x = NULL, y = "Mean runtime (ms)") +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line         = element_line(colour = "black", linewidth = 0.5),
+    axis.ticks         = element_line(colour = "black", linewidth = 0.5),
+    axis.ticks.length  = unit(3.5, "pt"),
+    axis.text          = element_text(colour = "black", size = 16),
+    axis.text.x        = element_text(margin = margin(t = 6)),
+    axis.text.y        = element_text(margin = margin(r = 4)),
+    axis.title         = element_text(size = 19),
+    axis.title.y       = element_text(margin = margin(r = 14)),
+    panel.grid.major.y = element_line(colour = "grey85", linewidth = 0.3),
+    strip.background   = element_blank(),
+    strip.placement    = "outside",
+    # the strips stand in for the x axis title, so styled like one (plain,
+    # 19pt, black) and 14pt below the tick labels, as in the flank figures
+    strip.switch.pad.wrap = unit(8, "pt"),
+    strip.text         = element_text(colour = "black", size = 19,
+                                      margin = margin(t = 6, b = 6)),
+    # a strip title wider than its panel ("Pos tx / gene") is not cut off
+    strip.clip         = "off",
+    panel.spacing.x    = unit(1.5, "lines")
+  )
 
-p
-
-# ggsave("benchmarks/results/bench_find_se.png", p, width = 8, height = 4, dpi = 150)
-# message("Saved → benchmarks/results/bench_find_se.png")
+ggsave("benchmarks/results/bench_find_se.png", p, width = 8, height = 7, dpi = 300)
+# the plot object too, for the combined figure (figures/plot_figure1.R)
+saveRDS(p, "benchmarks/results/bench_find_se.rds")
+message("Saved -> benchmarks/results/bench_find_se.png (+ .rds)")
