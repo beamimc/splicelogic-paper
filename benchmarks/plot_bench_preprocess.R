@@ -16,6 +16,16 @@ results <- bind_rows(lapply(runs, read.csv), .id = "run") |>
 cfg <- jsonlite::read_json("benchmarks/results/grid_config_preprocess.json")
 BL  <- cfg$baseline
 
+# the overlaid runs need not come from the same day, so stamp each with the
+# date its CSV was written
+run_dates <- vapply(runs, \(f) format(file.info(f)$mtime, "%Y-%m-%d"),
+                    character(1))
+run_caption <- sprintf(
+  "Benchmark runs: %s\nsplicelogic %s (latest run)",
+  paste(sprintf("%s %s", names(runs), run_dates), collapse = ", "),
+  cfg$splicelogic_version
+)
+
 panel_labels <- c(
   n_genes        = "Genes",
   n_tx_per_gene  = "Tx / gene",
@@ -51,6 +61,7 @@ p <- ggplot(plot_data, aes(x = focal_value, y = median_ms, color = run)) +
     title    = "preprocess() runtime by input size",
     subtitle = sprintf("BL: %d genes, %d tx/gene, %d exons/tx",
                        BL$n_genes, BL$n_tx_per_gene, BL$n_exons_per_tx),
+    caption = run_caption,
     x = NULL,
     y = "Median runtime (ms)"
   ) +

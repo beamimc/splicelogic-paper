@@ -1,5 +1,8 @@
 suppressPackageStartupMessages({
-  devtools::load_all("../splicelogic") # or library(splicelogic) if installed
+  # splicelogic devel, loaded from source: clone the repo next to this one
+  #   git clone -b devel https://github.com/thelovelab/splicelogic.git ../splicelogic
+  # then load it with devtools (install.packages("devtools") if needed)
+  devtools::load_all("../splicelogic")
   library(bench)
   library(dplyr)
 })
@@ -44,7 +47,9 @@ bm <- bench::mark(
   a3ss = find_a3ss(gr_a3),
   iterations = 20,
   time_unit  = "s",
-  filter_gc  = TRUE
+  filter_gc  = TRUE,
+  # the two finders detect different events, so their results never match
+  check      = FALSE
 )
 
 print(bm)

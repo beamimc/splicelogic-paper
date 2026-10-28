@@ -1,5 +1,8 @@
 suppressPackageStartupMessages({
-  devtools::load_all("../splicelogic") # or library(splicelogic) if installed
+  # splicelogic devel, loaded from source: clone the repo next to this one
+  #   git clone -b devel https://github.com/thelovelab/splicelogic.git ../splicelogic
+  # then load it with devtools (install.packages("devtools") if needed)
+  devtools::load_all("../splicelogic")
   library(bench)
   library(dplyr)
   library(GenomicRanges)
@@ -32,8 +35,11 @@ size_grid <- bind_rows(
 dir.create("benchmarks/results", recursive = TRUE, showWarnings = FALSE)
 jsonlite::write_json(
   list(
-    baseline = baseline,
-    coef_col = coef_col
+    baseline            = baseline,
+    coef_col            = coef_col,
+    run_date            = as.character(Sys.Date()),
+    splicelogic_version = read.dcf("../splicelogic/DESCRIPTION",
+                                   fields = "Version")[[1]]
   ),
   "benchmarks/results/grid_config_preprocess.json",
   auto_unbox = TRUE
