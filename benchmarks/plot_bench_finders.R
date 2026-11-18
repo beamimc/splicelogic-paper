@@ -33,10 +33,14 @@ panel_labels <- c(
 
 # one colour and one point shape per `type`. "over" is the blue of figure 1
 # (the A nucleotide colour of slPlotFlankProfilesByNt()); a finder without a
-# `type` argument is drawn in grey, so it is not read as one of the three.
-type_cols   <- c(over = "#3A86FF", boundary = "#FB5607", identical = "#8338EC")
-type_shapes <- c(over = 16, boundary = 17, identical = 15)
-untyped_col <- "grey30"
+# `type` argument is drawn in grey, so it is not read as one of the three, and
+# gets its own legend entry. Every plot carries all four levels, so the nine
+# legends are identical and figure S1 collects them into one.
+type_cols   <- c(over = "#3A86FF", boundary = "#FB5607", identical = "#8338EC",
+                 none = "grey30")
+type_shapes <- c(over = 16, boundary = 17, identical = 15, none = 16)
+type_labels <- c(over = "over", boundary = "boundary", identical = "identical",
+                 none = "no type argument")
 
 # finders drawn on the same y axis, so their runtimes can be compared directly:
 # the transcription start and end sites
@@ -63,7 +67,9 @@ finder_data <- function(event) {
   ) |>
     mutate(
       focal_dim = factor(focal_dim, levels = names(panel_labels)),
-      type      = factor(type, levels = names(type_cols)),
+      # NA for a finder without a `type` argument
+      type      = factor(ifelse(is.na(type), "none", type),
+                         levels = names(type_cols)),
       mean_ms   = mean_s * 1000,
       se_ms     = (sd_s * 1000) / sqrt(n_itr),
       lo        = mean_ms - se_ms,
@@ -78,8 +84,6 @@ finder_data <- function(event) {
 # the finder's own error bars, or those of every finder sharing its axis
 plot_finder <- function(event, plot_data = finder_data(event),
                         y_range = c(min(plot_data$lo), max(plot_data$hi))) {
-  typed <- !all(is.na(plot_data$type))
-
   # y axis from just below the lowest error bar (to the step below it, so no
   # empty band) to the highest error bar. Labelled every 25 ms, or at the
   # first wider step that leaves no more than 6 labels. An error bar less than
@@ -91,25 +95,22 @@ plot_finder <- function(event, plot_data = finder_data(event),
   y_lim   <- c(floor(y_range[1] / y_step + 0.1) * y_step, y_range[2])
   y_breaks <- seq(y_lim[1], y_lim[2], by = y_step)
 
-  # one line per type, or a single grey line when the finder has no type
-  p <- if (typed) {
-    ggplot(plot_data, aes(focal_value, mean_ms, colour = type, shape = type)) +
-      # spread across the iterations (gc iterations kept, see bench_finders.R):
-      # mean +/- SE, as error bars
-      geom_linerange(aes(ymin = lo, ymax = hi), linewidth = 0.6) +
-      geom_line(linewidth = 1.1) +
-      geom_point(size = 2.6) +
-      scale_colour_manual(values = type_cols, name = "type") +
-      scale_shape_manual(values = type_shapes, name = "type")
-  } else {
-    ggplot(plot_data, aes(focal_value, mean_ms)) +
-      geom_linerange(aes(ymin = lo, ymax = hi), linewidth = 0.6,
-                     colour = untyped_col) +
-      geom_line(linewidth = 1.1, colour = untyped_col) +
-      geom_point(size = 2.6, colour = untyped_col)
-  }
-
-  p +
+  # one line per type, or a single grey line ("none") when the finder has no
+  # type. `limits` keeps all four levels in every legend, present or not, and
+  # `show.legend = TRUE` draws a key for each of them (ggplot2 >= 3.5 leaves
+  # out the keys of levels absent from a layer's data otherwise), so the nine
+  # legends match and figure S1 merges them into one
+  ggplot(plot_data, aes(focal_value, mean_ms, colour = type, shape = type)) +
+    # spread across the iterations (gc iterations kept, see bench_finders.R):
+    # mean +/- SE, as error bars
+    geom_linerange(aes(ymin = lo, ymax = hi), linewidth = 0.6,
+                   show.legend = TRUE) +
+    geom_line(linewidth = 1.1, show.legend = TRUE) +
+    geom_point(size = 2.6, show.legend = TRUE) +
+    scale_colour_manual(values = type_cols, limits = names(type_cols),
+                        labels = type_labels, name = "type") +
+    scale_shape_manual(values = type_shapes, limits = names(type_cols),
+                       labels = type_labels, name = "type") +
     facet_wrap(
       ~ focal_dim,
       scales = "free_x",

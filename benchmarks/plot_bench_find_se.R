@@ -2,8 +2,12 @@ library(dplyr)
 library(ggplot2)
 library(jsonlite)
 
-results <- read.csv("benchmarks/results/bench_find_se.csv")
-cfg     <- jsonlite::read_json("benchmarks/results/grid_config.json")
+# the find_se() timings of benchmarks/bench_finders.R (the run behind figure
+# S1), so figure 1a and the SE panel of figure S1 come from the same run
+results <- read.csv("benchmarks/results/finders/bench_find_se.csv")
+cfg     <- jsonlite::read_json(
+  "benchmarks/results/finders/grid_config_find_se.json"
+)
 BL      <- cfg$baseline
 
 panel_labels <- c(
@@ -36,13 +40,16 @@ plot_data <- bind_rows(
   # thin the Pos tx / gene panel to 4 points across the swept range
   filter(!(focal_dim == "n_pos_per_gene" &
              !focal_value %in% c(1, 4, 7, 10))) |>
-  # figure 1 shows the default type only
+  # figure 1 shows the default type only (the CSV also has "boundary" and
+  # "identical")
   filter(type == "over")
 
-# y axis from just below the lowest error bar (to the 25 ms below it, so no
-# empty band) to the highest error bar, labelled every 25 ms
+# y axis from the 25 ms step below the lowest error bar to the 25 ms step
+# above the highest one, so both ends get a grid line and a label; labelled
+# every 25 ms
 y_step <- 25
-y_lim <- c(floor(min(plot_data$lo) / 25) * 25, max(plot_data$hi))
+y_lim <- c(floor(min(plot_data$lo) / y_step) * y_step,
+           ceiling(max(plot_data$hi) / y_step) * y_step)
 y_breaks <- seq(ceiling(y_lim[1] / y_step) * y_step, y_lim[2], by = y_step)
 
 p <- ggplot(plot_data, aes(focal_value, mean_ms)) +

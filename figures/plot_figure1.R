@@ -9,9 +9,9 @@ suppressPackageStartupMessages({
   library(here)
 })
 
-# panel a: saved by benchmarks/plot_bench_find_se.R, which plots the timings in
-# benchmarks/results/bench_find_se.csv (run benchmarks/bench_find_se.R first
-# to create or refresh that CSV)
+# panel a: saved by benchmarks/plot_bench_find_se.R, which plots the
+# type = "over" timings in benchmarks/results/finders/bench_find_se.csv (run
+# `Rscript benchmarks/bench_finders.R se` first to create or refresh that CSV)
 bench <- readRDS(here("benchmarks/results/bench_find_se.rds"))
 # panel b: saved by figures/plot_flank_profiles_by_nt.R (SE vs non-SE, from
 # the RBP workflow's data in workflows/data/)

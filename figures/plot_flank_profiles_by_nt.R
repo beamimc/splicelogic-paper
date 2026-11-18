@@ -100,6 +100,7 @@ plot_flank_figure <- function(profiles) {
     ggplot2::facet_wrap(~ nt, ncol = 1, strip.position = "left",
                         scales = "free_y") +
     ggplot2::scale_x_continuous(breaks = breaks, labels = labels) +
+    ggplot2::labs(x = "Relative position in intronic sequence (nt)") +
     # a little padding at both ends, and two or three round breaks per panel
     ggplot2::scale_y_continuous(
       breaks = function(l) {
