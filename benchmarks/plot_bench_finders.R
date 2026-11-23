@@ -49,6 +49,10 @@ type_labels <- c(over = "over", boundary = "boundary", identical = "identical",
 # the transcription start and end sites
 shared_y <- list(c("atss", "ates"))
 
+# their range is narrow (about 50 ms), where the 25 ms rule in plot_finder()
+# leaves two gridlines; 15 ms gives five, as on the other plots
+y_step_fixed <- c(atss = 15, ates = 15)
+
 # the timings of one finder along the three sweeps, in ms, one row per point
 finder_data <- function(event) {
   results <- read.csv(file.path(res_dir, sprintf("bench_find_%s.csv", event)))
@@ -84,17 +88,20 @@ finder_data <- function(event) {
 }
 
 # `y_range`: the lowest and highest values the y axis must show; by default
-# the finder's own error bars, or those of every finder sharing its axis
+# the finder's own error bars, or those of every finder sharing its axis.
+# `y_step`: the y label spacing, in ms, to use in place of the rule below
 plot_finder <- function(event, plot_data = finder_data(event),
-                        y_range = c(min(plot_data$lo), max(plot_data$hi))) {
+                        y_range = c(min(plot_data$lo), max(plot_data$hi)),
+                        y_step = NULL) {
   # y axis from just below the lowest error bar (to the step below it, so no
   # empty band) to the highest error bar. Labelled every 25 ms, or at the
-  # first wider step that leaves no more than 6 labels. An error bar less than
+  # first wider step that leaves no more than 6 labels, unless `y_step` is
+  # given. An error bar less than
   # a tenth of a step below a label starts the axis at that label, not a whole
   # step lower; the bar still shows, in the axis padding (coord_cartesian
   # below zooms rather than dropping data outside the limits).
   y_steps <- c(25, 50, 100, 200, 500, 1000)
-  y_step  <- y_steps[diff(y_range) / y_steps <= 6][1]
+  if (is.null(y_step)) y_step <- y_steps[diff(y_range) / y_steps <= 6][1]
   y_lim   <- c(floor(y_range[1] / y_step + 0.1) * y_step, y_range[2])
   y_breaks <- seq(y_lim[1], y_lim[2], by = y_step)
 
@@ -185,7 +192,9 @@ for (group in shared_y) {
 }
 
 plots <- lapply(setNames(nm = events),
-                \(e) plot_finder(e, data[[e]], y_ranges[[e]]))
+                \(e) plot_finder(e, data[[e]], y_ranges[[e]],
+                                 y_step = if (e %in% names(y_step_fixed))
+                                   y_step_fixed[[e]]))
 
 for (event in names(plots)) {
   ggsave(file.path(res_dir, sprintf("bench_find_%s.png", event)),
