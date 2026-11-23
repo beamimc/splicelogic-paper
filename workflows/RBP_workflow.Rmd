@@ -479,6 +479,46 @@ if (nrow(go_se_df) > 0) {
 
 ## Sequence context around the event exons, focusing on skipped exons (SE)
 
+### A minimal example: the intron upstream of SE exons
+
+A small example of the steps the helpers below wrap: take the 100 nt of intron
+upstream of each SE exon, get its sequence, then count the nucleotides and a
+motif in it. It is only an illustration: nothing further down uses these
+objects.
+
+```{r upstream_seq_example}
+# 100 nt of intron upstream of each SE exon (strand-aware), and its RNA
+# sequence; %>% rather than |> so that `.` passes the ranges to get_seq()
+se_upstream <- se_events %>%
+  plyranges::flank_upstream(100) %>%
+  mutate(intron_seq = get_seq(., "hg38", as_rna = TRUE))
+
+se_upstream$intron_seq
+```
+
+```{r upstream_frequencies}
+# nucleotide frequencies, one row per SE event
+nt_freq <- Biostrings::letterFrequency(se_upstream$intron_seq,
+                                       c("A", "C", "G", "U"), as.prob = TRUE)
+head(nt_freq)
+
+# averaged over all SE events
+colMeans(nt_freq)
+```
+
+```{r upstream_motifs}
+# YCUY (PTBP1) motif hits, one count per SE event: fixed = FALSE reads Y as C
+# or U, and overlapping matches all count, as in the RNA map below
+ycuy <- Biostrings::vcountPattern("YCUY", se_upstream$intron_seq,
+                                  fixed = FALSE)
+head(ycuy)
+
+# averaged over all SE events
+mean(ycuy)
+```
+
+### Nucleotide composition in sliding windows
+
 The analysis below uses a set of sequence-context helpers consolidated in
 `helper.R` (nucleotide-composition profiles, background exon sampling,
 splice-site logos and RBP motif scanning). The splicelogic package itself only

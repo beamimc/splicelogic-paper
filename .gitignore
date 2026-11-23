@@ -1,10 +1,12 @@
 CLAUDE.md
 NEXT-STEPS.md
 benchmarks/results/
+benchmarks/swan/results/
 validation/biosurfer/biosurfer_gencode_v42_output/*
 validation/biosurfer/biosurfer.pdf
 validation/biosurfer/biosurfer.txt
 validation/biosurfer/gencode.v42.*
+validation/rerun_2026-11-13/
 *.rds
 *.tar.gz
 validation/biosurfer/.DS_Store
