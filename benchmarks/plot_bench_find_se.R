@@ -53,7 +53,7 @@ y_lim <- c(floor(min(plot_data$lo) / y_step) * y_step,
 y_breaks <- seq(ceiling(y_lim[1] / y_step) * y_step, y_lim[2], by = y_step)
 
 p <- ggplot(plot_data, aes(focal_value, mean_ms)) +
-  # spread across the iterations (gc iterations kept, see bench_find_se.R):
+  # spread across the iterations (gc iterations kept, see bench_finders.R):
   # mean +/- SE, as error bars
   geom_linerange(aes(ymin = lo, ymax = hi), linewidth = 0.6,
                  colour = line_col) +

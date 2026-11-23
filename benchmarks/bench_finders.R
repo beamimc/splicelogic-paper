@@ -9,15 +9,18 @@ suppressPackageStartupMessages({
   library(purrr)
   library(tidyr)
 })
+source("benchmarks/mock_events.R")  # EVENT_TYPES, make_dataset()
 
-# bench_find_se.R for every finder: the same grid and the same timing, once per
+# Runtime of every find_*() function over one grid (genes / event ratio / up
+# transcripts per gene; the grid of bench_find_se.R), once per
 # find_*() function, each on a dataset carrying injected events of its own
-# type. One bench::mark() call per cell, timing each `type` the finder accepts
-# (find_se / find_ie / find_mxe; the other six have no `type` argument).
+# type, made by that event's generate_*() helper. One bench::mark() call per
+# cell, timing each `type` the finder accepts (find_se / find_ie / find_cse /
+# find_cie / find_mxe; the other six have no `type` argument).
 # Iterations that hit a garbage collection are kept (filter_gc = FALSE), so its
 # cost is part of the timing, and each iteration's gc level is saved.
 #
-# Run from the repo root. All nine finders:
+# Run from the repo root. All eleven finders:
 #   Rscript benchmarks/bench_finders.R
 # or only some of them, leaving the other finders' files as they are:
 #   Rscript benchmarks/bench_finders.R ri atss
@@ -42,32 +45,20 @@ fixed_n_exons_per_tx <- 15
 n_iterations <- 200
 # `type` values timed for the finders that have the argument
 types <- c("over", "boundary", "identical")
-# finders to run, by event name; any of the names of FINDERS below
-finders <- c("se", "ie", "mxe", "ri", "si", "a5ss", "a3ss", "atss", "ates")
+# finders to run, by event name: every event in EVENT_TYPES
+# (benchmarks/mock_events.R)
+finders <- names(EVENT_TYPES)
 # -------------------------------------------------------------------------
 
 out_dir <- "benchmarks/results/finders"
 
-# the function each event name stands for, and whether it has a `type` argument
-FINDERS <- list(
-  se   = list(fn = "find_se",   typed = TRUE),
-  ie   = list(fn = "find_ie",   typed = TRUE),
-  mxe  = list(fn = "find_mxe",  typed = TRUE),
-  ri   = list(fn = "find_ri",   typed = FALSE),
-  si   = list(fn = "find_si",   typed = FALSE),
-  a5ss = list(fn = "find_a5ss", typed = FALSE),
-  a3ss = list(fn = "find_a3ss", typed = FALSE),
-  atss = list(fn = "find_atss", typed = FALSE),
-  ates = list(fn = "find_ates", typed = FALSE)
-)
-
 # finders named on the command line replace the `finders` set above
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) > 0) finders <- args
-unknown <- setdiff(finders, names(FINDERS))
+unknown <- setdiff(finders, names(EVENT_TYPES))
 if (length(unknown) > 0) {
   stop("Unknown finder(s): ", paste(unknown, collapse = ", "),
-       ". Choose from: ", paste(names(FINDERS), collapse = ", "))
+       ". Choose from: ", paste(names(EVENT_TYPES), collapse = ", "))
 }
 
 size_grid <- bind_rows(
@@ -78,61 +69,6 @@ size_grid <- bind_rows(
 
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-# ---- Data construction --------------------------------------------------
-
-# create_mock_data() guarantees only that tx_order 1 (min tx_id per gene) is
-# negative and tx_order 2 positive; from the third on the sign is random.
-# Force the first n_neg transcripts of each gene negative and the rest
-# positive, so a cell has exactly the partition sizes asked for.
-assign_partition <- function(gr, n_neg) {
-  tx <- as.data.frame(gr) |>
-    distinct(gene_id, tx_id) |>
-    arrange(gene_id, tx_id) |>
-    group_by(gene_id) |>
-    mutate(tx_order = row_number()) |>
-    ungroup()
-  neg_ids <- tx$tx_id[tx$tx_order <= n_neg]
-  gr |>
-    mutate(estimate = if_else(tx_id %in% neg_ids, -abs(estimate), abs(estimate)))
-}
-
-# 1 negative + n_pos positive transcripts per gene, carrying n_events injected
-# events of one type. The partition is set before the generate_*() call, which
-# modifies positive transcripts.
-#
-# There is no generator for included exons or spliced introns: an ie is an se
-# seen from the other side, and an si an ri. Each is built as its counterpart
-# with the partition sizes swapped (n_pos negative + 1 positive), and the
-# estimates are then negated. That leaves the exon included in the n_pos
-# up-regulated transcripts and skipped in the one down-regulated transcript
-# (ie), or the intron spliced out by the n_pos up-regulated transcripts and
-# retained in the one down-regulated transcript (si).
-make_dataset <- function(event, n_genes, n_pos_per_gene, n_events) {
-  swap <- event %in% c("ie", "si")
-
-  gr <- create_mock_data(
-    n_genes        = n_genes,
-    n_tx_per_gene  = n_pos_per_gene + 1L,  # 1 negative + n_pos positive
-    n_exons_per_tx = fixed_n_exons_per_tx
-  )
-  gr <- assign_partition(gr, if (swap) n_pos_per_gene else 1L)
-
-  gr <- switch(event,
-    se   = generate_se(gr, n_events = n_events),
-    ie   = generate_se(gr, n_events = n_events),
-    mxe  = generate_mxe(gr, n_events = n_events),
-    ri   = generate_ri(gr, n_events = n_events),
-    si   = generate_ri(gr, n_events = n_events),
-    a5ss = generate_a5ss(gr, n_events = n_events),
-    a3ss = generate_a3ss(gr, n_events = n_events),
-    atss = generate_atss(gr, n_events = n_events),
-    ates = generate_ates(gr, n_events = n_events)
-  )
-
-  if (swap) gr <- mutate(gr, estimate = -estimate)
-  gr
-}
-
 cell_id <- function(n_genes, event_ratio, n_pos_per_gene) {
   sprintf("genes=%d_ratio=%.2f_pos=%d", n_genes, event_ratio, n_pos_per_gene)
 }
@@ -140,8 +76,8 @@ cell_id <- function(n_genes, event_ratio, n_pos_per_gene) {
 # ---- One finder over the whole grid -------------------------------------
 
 bench_finder <- function(event) {
-  finder <- FINDERS[[event]]
-  fn     <- as.name(finder$fn)
+  finder <- EVENT_TYPES[[event]]
+  fn     <- as.name(finder$find)
   # the type column: one value per timed expression, NA for a finder that has
   # no `type` argument
   finder_types <- if (finder$typed) types else NA_character_
@@ -151,12 +87,12 @@ bench_finder <- function(event) {
     setNames(lapply(types, function(type) bquote(.(fn)(gr, type = .(type)))),
              types)
   } else {
-    setNames(list(bquote(.(fn)(gr))), finder$fn)
+    setNames(list(bquote(.(fn)(gr))), finder$find)
   }
 
   jsonlite::write_json(
     list(
-      finder               = finder$fn,
+      finder               = finder$find,
       baseline             = baseline,
       fixed_n_exons_per_tx = fixed_n_exons_per_tx,
       n_iterations         = n_iterations,
@@ -170,7 +106,7 @@ bench_finder <- function(event) {
   )
 
   message(sprintf("%s(): %d grid cells x %d expression(s) x %d iterations ...",
-                  finder$fn, nrow(size_grid), length(type_exprs),
+                  finder$find, nrow(size_grid), length(type_exprs),
                   n_iterations))
 
   # the same seed for every finder, so a finder's datasets do not depend on
@@ -179,7 +115,10 @@ bench_finder <- function(event) {
 
   cells <- pmap(size_grid, function(n_genes, event_ratio, n_pos_per_gene) {
     n_events <- round(event_ratio * n_genes)
-    gr <- make_dataset(event, n_genes, n_pos_per_gene, n_events)
+    # 1 down + n_pos up transcripts per gene
+    gr <- make_dataset(event, n_genes = n_genes, n_pos = n_pos_per_gene,
+                       n_neg = 1L, n_exons_per_tx = fixed_n_exons_per_tx,
+                       n_events = n_events)
 
     # one untimed call per expression: what the finder returns on this
     # dataset, so the CSV doubles as a check that the injected events are
@@ -242,7 +181,7 @@ bench_finder <- function(event) {
   })
 
   per_itr <- map_dfr(cells, "per_itr") |>
-    mutate(finder = finder$fn, .before = 1)
+    mutate(finder = finder$find, .before = 1)
   detected <- map_dfr(cells, "detected")
   # the bench_mark objects too, for bench's autoplot()
   bms <- setNames(map(cells, "bm"), pmap_chr(size_grid, cell_id))

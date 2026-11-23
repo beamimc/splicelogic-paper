@@ -4,7 +4,8 @@ library(jsonlite)
 
 # plot_bench_find_se.R for every finder: one plot per find_*() function, from
 # the timings bench_finders.R wrote to benchmarks/results/finders/. A finder
-# with a `type` argument (find_se / find_ie / find_mxe) gets one line per type.
+# with a `type` argument (find_se / find_ie / find_cse / find_cie / find_mxe)
+# gets one line per type.
 # Run from the repo root. Writes, to benchmarks/results/finders/:
 #   bench_find_<event>.png   one plot per finder
 #   bench_finders_plots.rds  the plot objects, named by event, for the
@@ -16,6 +17,8 @@ res_dir <- "benchmarks/results/finders"
 finder_fns <- c(
   se   = "find_se",
   ie   = "find_ie",
+  cse  = "find_cse",
+  cie  = "find_cie",
   mxe  = "find_mxe",
   ri   = "find_ri",
   si   = "find_si",
@@ -34,7 +37,7 @@ panel_labels <- c(
 # one colour and one point shape per `type`. "over" is the blue of figure 1
 # (the A nucleotide colour of slPlotFlankProfilesByNt()); a finder without a
 # `type` argument is drawn in grey, so it is not read as one of the three, and
-# gets its own legend entry. Every plot carries all four levels, so the nine
+# gets its own legend entry. Every plot carries all four levels, so the eleven
 # legends are identical and figure S1 collects them into one.
 type_cols   <- c(over = "#3A86FF", boundary = "#FB5607", identical = "#8338EC",
                  none = "grey30")
@@ -98,7 +101,7 @@ plot_finder <- function(event, plot_data = finder_data(event),
   # one line per type, or a single grey line ("none") when the finder has no
   # type. `limits` keeps all four levels in every legend, present or not, and
   # `show.legend = TRUE` draws a key for each of them (ggplot2 >= 3.5 leaves
-  # out the keys of levels absent from a layer's data otherwise), so the nine
+  # out the keys of levels absent from a layer's data otherwise), so the eleven
   # legends match and figure S1 merges them into one
   ggplot(plot_data, aes(focal_value, mean_ms, colour = type, shape = type)) +
     # spread across the iterations (gc iterations kept, see bench_finders.R):
@@ -120,7 +123,7 @@ plot_finder <- function(event, plot_data = finder_data(event),
     # 1000 -> 1k, 2000 -> 2k (the Genes panel); small values stay as they are
     scale_x_continuous(
       # about three breaks per panel, few enough that the labels do not run
-      # together when nine of these plots share the combined figure
+      # together when eleven of these plots share the combined figure
       breaks = \(l) pretty(l, n = 3),
       labels = \(x) ifelse(x >= 1000, paste0(x / 1000, "k"), x)
     ) +
