@@ -1,0 +1,1344 @@
+---
+title: "splicelogic vs Swan genes on the Glinos PTBP1 dataset, FDR < 0.05"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+Which genes splicelogic and Swan each call, on the Glinos PTBP1 DTU
+transcripts at FDR < 0.05 (`sig_res.rds` holds them at FDR < 0.1, so they are
+cut again here):
+
+1. splicelogic `find_all_events()`: the genes with an SE, CSE or MXE, and,
+   apart, the genes with an RI.
+2. Swan `find_es_genes()` and `find_ir_genes()` on the same transcripts: the
+   genes with an exon skipping (ES) and the genes with an intron retention
+   (IR).
+3. The two lists compared, gene by gene. The genes Swan does not call are
+   checked for strand (Swan calls nothing on the minus strand), and the
+   plus-strand genes that do not match are looked at one by one.
+4. Why ATSS and ATES are left out of the comparison, though most Swan-only
+   genes are one, and the subset of them that Swan calls an exon skipping.
+5. Swan's gene graph next to splicelogic's events, with what each tool
+   calls, for one gene both detect, one minus-strand gene Swan does not, and
+   every plus-strand gene that does not match.
+6. A summary of all of it: what the two tools have in common, where they
+   differ, the genes both call on the plus strand, and every plus-strand gene
+   they do not agree on, with why; then the same numbers in tables.
+
+Everything runs here: R chunks for splicelogic, Python chunks (through
+reticulate, in the conda env `swan`; see *Python environment* below) for Swan.
+Swan is run as released.
+
+**Read from disk** (built by `workflows/RBP_workflow.Rmd`, not here):
+
+| file | what | built in `RBP_workflow.Rmd` chunk |
+|---|---|---|
+| `workflows/data/sig_res.rds` | satuRn DTU results, FDR < 0.1, genes with >= 1 up and >= 1 down transcript | `sig_res_filtered` |
+| `workflows/data/gencode.v48.sqlite` | GENCODE v48 TxDb | `txdb` |
+
+**Written here**, all under `benchmarks/swan/results/gene_match_fdr0.05/`:
+
+| file | object | chunk |
+|---|---|---|
+| `down.gtf` | `down` | `write_gtfs` |
+| `up.gtf` | `up` | `write_gtfs` |
+| `sl_events.csv` | `sl_df` | `events_table` |
+| `swan_es.csv` | `es_df` | `swan_gene_lists` |
+| `swan_ir.csv` | `ir_df` | `swan_gene_lists` |
+| `gene_match.csv` | `gene_match` | `gene_match` |
+| `plus_strand_mismatch.csv` | `plus_mismatch` | `plus_mismatch` |
+| `plots/<gid>.png` | Swan gene graphs | `swan_plots` |
+| `es_variants.csv` | `es_variants` | `es_variants` |
+| `es_subset_plus_mismatch.csv` | `subset_plus` | `subset_reasons` |
+| `mismatch_list.csv` | `mismatch_list` | `mismatch_list` |
+
+```{r setup, message=FALSE, warning=FALSE}
+library(GenomicRanges)
+library(ggplot2)
+library(patchwork)
+library(here)
+library(reticulate)
+use_condaenv("swan", required = TRUE)
+# splicelogic devel, loaded from the sibling repo as in RBP_workflow.Rmd
+devtools::load_all(here("../splicelogic"), quiet = TRUE)
+
+fdr <- 0.05
+stopifnot(fdr <= 0.1)  # sig_res.rds holds the FDR < 0.1 transcripts only
+
+out_dir  <- here("benchmarks/swan/results", paste0("gene_match_fdr", fdr))
+plot_dir <- file.path(out_dir, "plots")
+dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
+
+no_version <- function(x) sub("\\..*", "", x)  # ENSG00000112305.16 -> ENSG00000112305
+```
+
+## Python environment
+
+Set up once, from a terminal. Swan 3.2 is from 2023 and needs `pandas < 2`,
+which in turn needs Python 3.10 and older numpy and scipy. It also needs
+networkx 2.5: Swan draws a straight edge with `connectionstyle=None`, which
+networkx 2.6 and later pass on to matplotlib, which rejects it, so the graph
+of any gene with a straight edge fails to plot. pip warns that scanpy wants
+networkx 2.7.1 or later; nothing run here needs it.
+
+```bash
+conda create -n swan python=3.10
+conda activate swan
+pip install swan_vis==3.2 "numpy<2" "scipy<1.12" "umap-learn<0.6"
+pip install networkx==2.5.1
+```
+
+The Python that reticulate runs for this report:
+
+```{r python_config}
+reticulate::py_config()
+```
+
+The versions of Python and of the packages Swan needs, as used here:
+
+```{python python_packages}
+import sys
+from importlib.metadata import distributions, version
+import pandas as pd
+
+pkgs = ['swan_vis', 'pandas', 'numpy', 'scipy', 'networkx', 'matplotlib',
+        'anndata', 'scanpy', 'umap-learn']
+pd.DataFrame({'package': ['python'] + pkgs,
+              'version': [sys.version.split()[0]] + [version(p) for p in pkgs]})
+```
+
+<details>
+<summary>Every package in the env</summary>
+
+```{python python_all_packages}
+all_pkgs = sorted({(d.metadata['Name'], d.version) for d in distributions()},
+                  key=lambda p: p[0].lower())
+print(pd.DataFrame(all_pkgs, columns=['package', 'version']).to_string(index=False))
+```
+
+</details>
+
+## 1. DTU transcripts at FDR < 0.05
+
+`sig_res` from `RBP_workflow.Rmd` cut again at `fdr`. After the cut some genes
+are left with only up or only down transcripts, so, as in `RBP_workflow.Rmd`,
+only the genes with at least one up and one down transcript are kept.
+
+```{r dtu_fdr}
+sig_res <- readRDS(here("workflows/data/sig_res.rds"))
+c(transcripts = nrow(sig_res), genes = length(unique(sig_res$gene_id)))
+
+sig_res <- sig_res[sig_res$regular_FDR < fdr, ]
+
+n_up   <- tapply(sig_res$estimates > 0, sig_res$gene_id, sum)
+n_down <- tapply(sig_res$estimates < 0, sig_res$gene_id, sum)
+paired_genes <- names(n_up)[n_up > 0 & n_down > 0]
+sig_res <- sig_res[sig_res$gene_id %in% paired_genes, ]
+
+c(transcripts = nrow(sig_res), genes = length(unique(sig_res$gene_id)))
+```
+
+Their exons, with `prepare_exons()` as in `RBP_workflow.Rmd`, and the gene
+symbols:
+
+```{r prepare_exons, message=FALSE}
+txdb <- AnnotationDbi::loadDb(here("workflows/data/gencode.v48.sqlite"))
+sl_exons <- prepare_exons(txdb, sig_res, coef_col = "estimates")
+
+ensembl <- no_version(sl_exons$gene_id)
+symbol <- AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db, unique(ensembl),
+                                column = "SYMBOL", keytype = "ENSEMBL")
+sl_exons$gene_name <- ifelse(is.na(symbol[ensembl]), ensembl, symbol[ensembl])
+```
+
+The two groups, by the sign of the satuRn estimate:
+
+- **down** = higher usage in KD, the reference group in splicelogic
+- **up** = higher usage in WT
+
+```{r up_down}
+up   <- sl_exons[sl_exons$estimates > 0]
+down <- sl_exons[sl_exons$estimates < 0]
+data.frame(
+  set         = c("up (higher in WT)", "down (higher in KD)"),
+  transcripts = c(length(unique(up$tx_id)), length(unique(down$tx_id))),
+  genes       = c(length(unique(up$gene_id)), length(unique(down$gene_id))),
+  exons       = c(length(up), length(down))
+)
+```
+
+One row per gene, with its name and strand:
+
+```{r genes}
+genes <- unique(data.frame(gid       = no_version(sl_exons$gene_id),
+                           gene_name = sl_exons$gene_name,
+                           strand    = as.character(strand(sl_exons))))
+stopifnot(!anyDuplicated(genes$gid))
+table(strand = genes$strand)
+```
+
+## 2. splicelogic: genes with SE / CSE / MXE, and genes with RI
+
+```{r find_events}
+sl_pre <- preprocess(sl_exons, coef_col = "estimates")
+sl_ev  <- find_all_events(sl_pre, verbose = FALSE)
+table(sl_ev$event_type)
+```
+
+The events as a flat table: one row per exon and up/down transcript pair, with
+the up and down transcript named (the row's own transcript, `tx`, is the up
+one when its estimate is positive) and the gene id without its version, as
+Swan writes it.
+
+```{r events_table}
+up_tx   <- function(ev) ifelse(ev$estimate > 0, ev$tx_id, ev$event_tx_id)
+down_tx <- function(ev) ifelse(ev$estimate > 0, ev$event_tx_id, ev$tx_id)
+
+sl_df <- data.frame(
+  gid       = no_version(sl_ev$gene_id),
+  gene_name = sl_ev$gene_name,
+  type      = sl_ev$event_type,
+  strand    = as.character(strand(sl_ev)),
+  start     = start(sl_ev),
+  end       = end(sl_ev),
+  up        = up_tx(sl_ev),
+  down      = down_tx(sl_ev),
+  tx        = sl_ev$tx_id,      # the transcript the row's exon belongs to
+  rank      = sl_ev$exon_rank
+)
+write.csv(sl_df, file.path(out_dir, "sl_events.csv"), row.names = FALSE)
+head(sl_df)
+```
+
+The two gene lists:
+
+- **SE + CSE + MXE**: what Swan's exon skipping covers
+- **RI**: what Swan's intron retention covers
+
+```{r sl_gene_lists}
+genes_with <- function(types) unique(sl_df$gid[sl_df$type %in% types])
+sl_es_genes <- genes_with(c("se", "cse", "mxe"))
+sl_ri_genes <- genes_with("ri")
+c(se_cse_mxe = length(sl_es_genes), ri = length(sl_ri_genes))
+```
+
+## 3. Swan: `find_es_genes()` and `find_ir_genes()`
+
+### GTFs
+
+The down transcripts are Swan's annotation
+(`add_annotation()`), the up transcripts its transcriptome
+(`add_transcriptome()`), so a "novel" edge is one that no down transcript has.
+Swan needs a `transcript` row for each transcript, followed by its `exon`
+rows.
+
+```{r write_gtfs}
+write_swan_gtf <- function(gr, file) {
+  ex <- GRanges(seqnames(gr), ranges(gr), strand(gr),
+                source = "splicelogic", type = "exon",
+                gene_id = gr$gene_id, gene_name = gr$gene_name,
+                transcript_id = gr$tx_id, exon_rank = gr$exon_rank)
+  # one range per transcript, from its first to its last exon
+  tx <- unlist(range(split(ex, ex$transcript_id)))
+  mcols(tx) <- mcols(ex)[match(names(tx), ex$transcript_id), ]
+  tx$type <- "transcript"
+  tx$exon_rank <- 0L  # sorts the transcript row before its exons
+  # no names: rtracklayer would write them as an ID attribute, empty for the
+  # transcript rows, which Swan cannot parse
+  gtf <- unname(c(tx, ex))
+  gtf <- gtf[order(gtf$transcript_id, gtf$exon_rank)]
+  gtf$exon_rank <- NULL
+  rtracklayer::export(gtf, file, format = "gtf")
+}
+
+write_swan_gtf(down, file.path(out_dir, "down.gtf"))
+write_swan_gtf(up,   file.path(out_dir, "up.gtf"))
+```
+
+### Build the SwanGraph
+
+No counts: `find_es_genes()` and `find_ir_genes()` do not use them.
+
+```{python build_graph}
+import pandas as pd
+import matplotlib.pyplot as plt
+import swan_vis as swan
+
+sg = swan.SwanGraph()
+sg.add_annotation(r.out_dir + '/down.gtf')       # down transcripts
+sg.add_transcriptome(r.out_dir + '/up.gtf')      # up transcripts
+```
+
+### Exon skipping and intron retention
+
+Swan 3.2 raises an `AttributeError` instead of returning an empty table when
+either function finds nothing, so that error is read as "no calls".
+
+```{python find_es_ir}
+def swan_calls(find):
+    try:
+        return find().reset_index(drop=True)   # Swan gives every row the index 0
+    except AttributeError:
+        return pd.DataFrame(columns=['gid', 'tid', 'edge_id'])
+
+es_raw = swan_calls(sg.find_es_genes)
+ir_raw = swan_calls(sg.find_ir_genes)
+```
+
+Swan writes a row once for every exon an edge skips (or intron it retains);
+the duplicates are dropped, leaving one row per gene, up transcript and edge.
+The edge's strand and the coordinates of its two nodes are added: for an
+intron, the last base of the exon before it and the first base of the exon
+after it; for an exon, its first and last base.
+
+```{python es_ir_coords}
+def add_coords(df):
+    df = df.drop_duplicates(['gid', 'tid', 'edge_id']).reset_index(drop=True)
+    edges = sg.edge_df.loc[df.edge_id, ['v1', 'v2', 'strand']].reset_index(drop=True)
+    df = df.join(edges)
+    df['start'] = sg.loc_df.loc[df.v1, 'coord'].values
+    df['end'] = sg.loc_df.loc[df.v2, 'coord'].values
+    return df
+
+es_df = add_coords(es_raw)
+ir_df = add_coords(ir_raw)
+es_df.head()
+```
+
+The two gene lists, in R:
+
+```{r swan_gene_lists}
+es_df <- py$es_df
+ir_df <- py$ir_df
+write.csv(es_df, file.path(out_dir, "swan_es.csv"), row.names = FALSE)
+write.csv(ir_df, file.path(out_dir, "swan_ir.csv"), row.names = FALSE)
+
+swan_es_genes <- unique(no_version(es_df$gid))
+swan_ir_genes <- unique(no_version(ir_df$gid))
+stopifnot(all(c(swan_es_genes, swan_ir_genes) %in% genes$gid))
+c(es = length(swan_es_genes), ir = length(swan_ir_genes))
+```
+
+## 4. Compare the gene lists
+
+By gene, not by event: `find_es_genes()` and `find_ir_genes()` stop at the
+first edge they call in a gene (`if gid in es_genes: continue` in
+`swangraph.py`), so Swan's output is a gene list, not every event of each
+gene. Counting events would set that one call against all of splicelogic's.
+
+Each gene called by either tool, for each of the two comparisons:
+
+- **ES**: Swan `find_es_genes()` vs splicelogic SE + CSE + MXE
+- **IR**: Swan `find_ir_genes()` vs splicelogic RI
+
+```{r gene_match}
+gene_calls <- function(event, swan_gid, sl_gid) {
+  d <- genes[genes$gid %in% union(swan_gid, sl_gid), ]
+  d$event       <- event
+  d$swan        <- d$gid %in% swan_gid
+  d$splicelogic <- d$gid %in% sl_gid
+  d$status <- factor(ifelse(d$swan & d$splicelogic, "both",
+                            ifelse(d$swan, "Swan only", "splicelogic only")),
+                     levels = c("both", "Swan only", "splicelogic only"))
+  d
+}
+gene_match <- rbind(
+  gene_calls("ES", swan_es_genes, sl_es_genes),
+  gene_calls("IR", swan_ir_genes, sl_ri_genes)
+)
+gene_match <- gene_match[order(gene_match$event, gene_match$status,
+                               gene_match$strand, gene_match$gene_name), ]
+rownames(gene_match) <- NULL
+write.csv(gene_match, file.path(out_dir, "gene_match.csv"), row.names = FALSE)
+
+table(event = gene_match$event, gene_match$status)
+```
+
+By strand:
+
+```{r gene_match_strand}
+ftable(table(event = gene_match$event, strand = gene_match$strand,
+             status = gene_match$status))
+```
+
+The genes that do not match:
+
+```{r gene_mismatch}
+gene_match[gene_match$status != "both",
+           c("event", "status", "strand", "gene_name", "gid")]
+```
+
+## 5. Genes splicelogic calls and Swan does not: minus strand?
+
+The genes splicelogic calls and Swan does not, by strand:
+
+```{r sl_only_strand}
+sl_only <- gene_match[gene_match$status == "splicelogic only", ]
+table(event = sl_only$event, strand = sl_only$strand)
+```
+
+And every Swan call, by strand:
+
+```{r swan_strand}
+table(ES = es_df$strand)
+table(IR = ir_df$strand)
+```
+
+Swan calls nothing on the minus strand. Both functions look for the skipped
+exon (or retained intron) among the nodes `range(v1+1, v2)` between the two
+ends of a novel edge, and Swan numbers the nodes in genomic order but points
+each edge in the direction of transcription, so on the minus strand every edge
+runs from the higher node id to the lower one (`v1 > v2`) and that range is
+empty. In this graph:
+
+```{python edge_direction}
+edges = sg.edge_df[['edge_type', 'strand']].copy()
+edges['v1 < v2'] = sg.edge_df.v1 < sg.edge_df.v2
+edges.groupby(['edge_type', 'strand', 'v1 < v2']).size()
+```
+
+So all the minus-strand genes splicelogic calls are splicelogic only. The
+plus-strand ones that are splicelogic only, and the Swan-only ones, are
+looked at next.
+
+## 6. Plus-strand genes that do not match: what happened
+
+What `find_es_genes()` and `find_ir_genes()` test, from `swangraph.py`:
+
+- only **novel** edges: an intron (ES) or exon (IR) of an up transcript that
+  **no** down transcript has, pooled over all the down transcripts of the
+  graph
+- ES: the novel intron has, strictly inside it, a whole exon of **any**
+  transcript of the same gene, down or up
+- IR: the novel exon has, strictly inside it, a whole intron of any
+  transcript (the check that the intron is of the same gene is computed but
+  not used)
+- at most one edge per gene: once a gene has a call, its other novel edges
+  are skipped
+
+splicelogic instead compares one up transcript with one down transcript at a
+time.
+
+The exons of every transcript, and its introns as Swan's edges (the last base
+of one exon to the first base of the next), from `sl_pre`:
+
+```{r tx_exons}
+tx_exons <- as.data.frame(sl_pre)[, c("gene_id", "tx_id", "exon_rank",
+                                      "nexons", "start", "end", "estimate")]
+tx_exons$gid <- no_version(tx_exons$gene_id)
+tx_exons$up  <- tx_exons$estimate > 0
+tx_exons <- tx_exons[order(tx_exons$tx_id, tx_exons$start), ]
+
+last <- nrow(tx_exons)
+same_tx <- tx_exons$tx_id[-1] == tx_exons$tx_id[-last]
+introns <- data.frame(gid   = tx_exons$gid[-last],
+                      tx    = tx_exons$tx_id[-last],
+                      up    = tx_exons$up[-last],
+                      start = tx_exons$end[-last],
+                      end   = tx_exons$start[-1])[same_tx, ]
+```
+
+Swan's own edges, with the coordinates of their two nodes and `annotation`
+(`TRUE`: in a down transcript, so not novel and never tested):
+
+```{python swan_edges}
+swan_edges = sg.edge_df[['edge_type', 'strand', 'annotation']].copy()
+swan_edges['chrom'] = sg.loc_df.loc[sg.edge_df.v1, 'chrom'].values
+swan_edges['start'] = sg.loc_df.loc[sg.edge_df.v1, 'coord'].values
+swan_edges['end'] = sg.loc_df.loc[sg.edge_df.v2, 'coord'].values
+swan_edges = swan_edges.reset_index(drop=True)
+```
+
+```{r swan_edges_r}
+swan_edges <- py$swan_edges
+# Swan's annotation flag of the plus-strand edge from start to end
+swan_annotated <- function(type, start, end) {
+  hit <- swan_edges$edge_type == type & swan_edges$strand == "+" &
+         swan_edges$start == start & swan_edges$end == end
+  if (!any(hit)) return(NA)
+  any(as.logical(swan_edges$annotation[hit]))
+}
+# every event type splicelogic calls in a gene
+sl_types_in_gene <- function(gid) {
+  paste(sort(unique(sl_df$type[sl_df$gid == gid])), collapse = " + ")
+}
+plus <- gene_match[gene_match$strand == "+", ]
+```
+
+### splicelogic only, ES
+
+Each SE, CSE and MXE exon of those genes: the down transcript's exon (for an
+MXE, the row of the down transcript, the exon the up transcript does not
+have), the up transcript's intron that runs across it, the down transcripts
+that have that same intron, and Swan's `annotation` flag for it.
+
+```{r sl_only_es}
+ids <- plus$gid[plus$event == "ES" & plus$status == "splicelogic only"]
+sl_skip <- sl_df[sl_df$gid %in% ids & sl_df$type %in% c("se", "cse", "mxe") &
+                   sl_df$tx == sl_df$down, ]
+
+sl_only_es <- do.call(rbind, lapply(seq_len(nrow(sl_skip)), function(i) {
+  r  <- sl_skip[i, ]
+  ui <- introns[introns$tx == r$up & introns$start < r$start &
+                  introns$end > r$end, ]
+  in_down <- introns[!introns$up & introns$gid == r$gid &
+                       introns$start == ui$start & introns$end == ui$end, ]
+  data.frame(
+    gene_name           = r$gene_name,
+    gid                 = r$gid,
+    type                = r$type,
+    up_tx               = r$up,
+    down_tx             = r$down,
+    exon                = paste0(r$start, "-", r$end),
+    up_intron           = paste0(ui$start, "-", ui$end),
+    intron_also_in_down = paste(unique(in_down$tx), collapse = ", "),
+    swan_annotated      = swan_annotated("intron", ui$start, ui$end)
+  )
+}))
+sl_only_es
+```
+
+In every one, the up transcript's intron is also in another down transcript,
+so it is in Swan's annotation and never tested:
+
+```{r sl_only_es_check}
+all(sl_only_es$intron_also_in_down != "" & sl_only_es$swan_annotated)
+```
+
+### splicelogic only, IR
+
+Each RI of those genes: the up transcript's exon that retains the intron (an
+RI row is always the up transcript's exon), the down transcripts that have
+that same exon, and Swan's `annotation` flag for it.
+
+```{r sl_only_ri}
+ids <- plus$gid[plus$event == "IR" & plus$status == "splicelogic only"]
+sl_ri <- unique(sl_df[sl_df$gid %in% ids & sl_df$type == "ri",
+                      c("gene_name", "gid", "up", "down", "start", "end")])
+
+sl_only_ri <- do.call(rbind, lapply(seq_len(nrow(sl_ri)), function(i) {
+  r <- sl_ri[i, ]
+  in_down <- tx_exons[!tx_exons$up & tx_exons$gid == r$gid &
+                        tx_exons$start == r$start & tx_exons$end == r$end, ]
+  data.frame(
+    gene_name         = r$gene_name,
+    gid               = r$gid,
+    type              = "ri",
+    up_tx             = r$up,
+    down_tx           = r$down,
+    up_exon           = paste0(r$start, "-", r$end),
+    exon_also_in_down = paste(unique(in_down$tx_id), collapse = ", "),
+    swan_annotated    = swan_annotated("exon", r$start, r$end)
+  )
+}))
+sl_only_ri
+```
+
+```{r sl_only_ri_check}
+all(sl_only_ri$exon_also_in_down != "" & sl_only_ri$swan_annotated)
+```
+
+### Swan only, ES
+
+For each Swan ES row of those genes, the exons strictly inside its novel
+intron (the test `find_es_genes()` runs), from any transcript of the gene. For
+each down transcript with one of them, where those exons are in it, and what
+splicelogic calls for that up/down pair. A row whose exons inside the intron
+are in no down transcript gets one line, with the up transcripts that have
+them.
+
+```{r swan_only_es}
+ids <- plus$gid[plus$event == "ES" & plus$status == "Swan only"]
+es_rows <- es_df[no_version(es_df$gid) %in% ids, ]
+
+swan_only_es <- do.call(rbind, lapply(seq_len(nrow(es_rows)), function(i) {
+  r   <- es_rows[i, ]
+  gid <- no_version(r$gid)
+  ge  <- tx_exons[tx_exons$gid == gid, ]
+  inside <- ge[ge$start > r$start & ge$end < r$end, ]
+  row <- data.frame(gene_name   = genes$gene_name[genes$gid == gid],
+                    gid         = gid,
+                    up_tx       = r$tid,
+                    swan_intron = paste0(r$start, "-", r$end))
+  if (all(inside$up)) {
+    return(cbind(row, down_tx = NA, down_exons_inside = NA,
+                 reason = "exon inside only in up transcripts",
+                 splicelogic_pair = NA,
+                 exon_inside_in = paste(unique(inside$tx_id), collapse = ", ")))
+  }
+  down_inside <- inside[!inside$up, ]
+  do.call(rbind, lapply(split(down_inside, down_inside$tx_id), function(d) {
+    n <- d$nexons[1]
+    reason <-
+      if (any(d$exon_rank == 1)) "down transcript's first exon: alternative first exon"
+      else if (any(d$exon_rank == n)) "down transcript's last exon: alternative last exon"
+      else "internal exon of the down transcript"
+    pair <- sl_df$type[sl_df$gid == gid & sl_df$up == r$tid &
+                         sl_df$down == d$tx_id[1]]
+    cbind(row, down_tx = d$tx_id[1],
+          down_exons_inside = paste0(paste(d$exon_rank, collapse = ","),
+                                     " of ", n),
+          reason = reason,
+          splicelogic_pair = paste(sort(unique(pair)), collapse = " + "),
+          exon_inside_in = NA)
+  }))
+}))
+rownames(swan_only_es) <- NULL
+swan_only_es
+```
+
+By reason, and what splicelogic calls for the same up/down pair:
+
+```{r swan_only_es_reasons}
+table(reason = swan_only_es$reason,
+      splicelogic_pair = swan_only_es$splicelogic_pair, useNA = "ifany")
+```
+
+- **Alternative first / last exon**: the exon inside Swan's novel intron is
+  the down transcript's first (last) exon, and the up transcript has exons
+  beyond it. For splicelogic that exon is terminal, not internal, so it is
+  not an SE: the pair is an ATSS (ATES). Section 7 shows that splicelogic
+  calls every one of these pairs.
+- **Exon inside only in up transcripts**: Swan counts an exon of any
+  transcript of the gene; splicelogic compares up transcripts with down ones
+  only, so an exon no down transcript has is never skipped.
+
+### One row per gene
+
+```{r plus_mismatch}
+gene_reasons <- function(d, event, status, reason) {
+  d <- unique(data.frame(event = event, status = status,
+                         gene_name = d$gene_name, gid = d$gid,
+                         reason = reason))
+  d$splicelogic_calls <- vapply(d$gid, sl_types_in_gene, character(1))
+  d
+}
+plus_mismatch <- rbind(
+  gene_reasons(sl_only_es, "ES", "splicelogic only",
+               ifelse(sl_only_es$swan_annotated,
+                      "skipping intron also in a down transcript", "other")),
+  gene_reasons(sl_only_ri, "IR", "splicelogic only",
+               ifelse(sl_only_ri$swan_annotated,
+                      "retaining exon also in a down transcript", "other")),
+  gene_reasons(swan_only_es, "ES", "Swan only", swan_only_es$reason)
+)
+rownames(plus_mismatch) <- NULL
+write.csv(plus_mismatch, file.path(out_dir, "plus_strand_mismatch.csv"),
+          row.names = FALSE)
+
+# every plus-strand gene that does not match has a reason
+stopifnot(setequal(paste(plus_mismatch$event, plus_mismatch$gid),
+                   paste(plus$event, plus$gid)[plus$status != "both"]))
+table(plus_mismatch$reason, plus_mismatch$status)
+plus_mismatch
+```
+
+Section 8 plots every one of these genes, Swan next to splicelogic.
+
+## 7. ATSS and ATES
+
+Most of the plus-strand Swan-only ES genes are an alternative first or last
+exon, which splicelogic calls ATSS or ATES, not SE. ATSS and ATES are still
+left out of the comparison in section 4, because most of them are not an exon
+skipping for Swan either. An ATSS (ATES) is any up transcript whose first
+(last) exon starts (ends) somewhere else than the down transcript's, while
+Swan's ES needs a novel intron that runs across a whole exon. Only when the up
+transcript has an intron running across the down transcript's whole first
+(last) exon, because the up transcript starts before it (ends after it), is the
+ATSS (ATES) also an exon skipping for Swan.
+
+### Which ATSS and ATES are an exon skipping for Swan
+
+An ATSS or ATES row is the up transcript's first or last exon, so the down
+transcript's is taken from its exons: for each up/down pair with an ATSS
+(ATES), the down transcript's first (last) exon by `exon_rank`, and the up
+transcript's intron that runs across it, if there is one.
+
+```{r terminal_exons}
+term_pairs <- unique(sl_df[sl_df$type %in% c("atss", "ates"),
+                           c("gene_name", "gid", "strand", "type", "up",
+                             "down")])
+
+term_exons <- do.call(rbind, lapply(seq_len(nrow(term_pairs)), function(i) {
+  r <- term_pairs[i, ]
+  d <- tx_exons[tx_exons$tx_id == r$down, ]
+  # the down transcript's first exon for an ATSS, its last exon for an ATES
+  e <- if (r$type == "atss") d[d$exon_rank == 1, ] else d[d$exon_rank == d$nexons, ]
+  ui <- introns[introns$tx == r$up & introns$start < e$start &
+                  introns$end > e$end, ]
+  cbind(r, down_exon_start = e$start, down_exon_end = e$end,
+        intron_start = if (nrow(ui) > 0) ui$start else NA,
+        intron_end   = if (nrow(ui) > 0) ui$end else NA)
+}))
+term_exons$inside_up_intron <- !is.na(term_exons$intron_start)
+rownames(term_exons) <- NULL
+
+table(type = term_exons$type, inside_up_intron = term_exons$inside_up_intron)
+```
+
+### The gene lists with ATSS and ATES added
+
+Three versions of splicelogic's ES gene list, each against Swan's ES genes:
+
+- **SE + CSE + MXE**: as in section 4
+- **+ all ATSS / ATES**: and every gene with an ATSS or ATES
+- **+ ATSS / ATES subset**: and only the genes with an ATSS / ATES pair above
+  whose down terminal exon is inside an up intron
+
+```{r es_variants}
+all_term_genes <- unique(term_exons$gid)
+sub_term_genes <- unique(term_exons$gid[term_exons$inside_up_intron])
+
+es_variants <- rbind(
+  gene_calls("SE + CSE + MXE", swan_es_genes, sl_es_genes),
+  gene_calls("+ all ATSS / ATES", swan_es_genes,
+             union(sl_es_genes, all_term_genes)),
+  gene_calls("+ ATSS / ATES subset", swan_es_genes,
+             union(sl_es_genes, sub_term_genes))
+)
+es_variants$event <- factor(es_variants$event,
+                            levels = unique(es_variants$event))
+write.csv(es_variants, file.path(out_dir, "es_variants.csv"), row.names = FALSE)
+
+ftable(table(splicelogic = es_variants$event, strand = es_variants$strand,
+             status = es_variants$status))
+```
+
+With all ATSS / ATES, no gene is left Swan only, but many more are
+splicelogic only, on both strands: most ATSS and ATES move the start or end of
+the first or last exon without running an intron across a whole exon. With
+the subset, the Swan-only genes go from 32 to 3 and the plus-strand
+splicelogic-only genes from 6 to 7; on the minus strand, where Swan calls
+nothing, the splicelogic-only genes go from 73 to 100.
+
+### The alternative first / last exon genes
+
+Each Swan-only row from section 6 whose exon inside the novel intron is the
+down transcript's first or last exon, and whether the subset has the same
+pair: the same up transcript, the same down transcript and the same intron.
+
+```{r alt_terminal_recovered}
+swan_alt  <- swan_only_es[grepl("alternative", swan_only_es$reason), ]
+sub_pairs <- term_exons[term_exons$inside_up_intron, ]
+
+swan_alt$in_subset <-
+  paste(swan_alt$up_tx, swan_alt$down_tx, swan_alt$swan_intron) %in%
+  paste(sub_pairs$up, sub_pairs$down,
+        paste0(sub_pairs$intron_start, "-", sub_pairs$intron_end))
+
+table(reason = swan_alt$reason, in_subset = swan_alt$in_subset)
+c(genes = length(unique(swan_alt$gid)),
+  in_subset = length(unique(swan_alt$gid[swan_alt$in_subset])))
+```
+
+splicelogic calls every one of them: the same up transcript, against the same
+down transcript, with the same intron Swan reports.
+
+### What is left on the plus strand
+
+The plus-strand genes that still do not match with the subset added, with the
+reason found in section 6:
+
+```{r subset_mismatch}
+subset_plus <- es_variants[es_variants$event == "+ ATSS / ATES subset" &
+                             es_variants$strand == "+" &
+                             es_variants$status != "both",
+                           c("status", "gene_name", "gid")]
+es_reasons <- plus_mismatch[plus_mismatch$event == "ES", ]
+subset_plus$reason <- es_reasons$reason[match(subset_plus$gid, es_reasons$gid)]
+rownames(subset_plus) <- NULL
+subset_plus
+```
+
+**The 6 splicelogic-only genes from section 6** (CD46, FXR1, CALU, CALD1,
+SPTAN1, HNRNPA1; table `sl_only_es`). splicelogic pairs the up transcript with
+a down transcript that has the exon, and calls an SE. But another down
+transcript has the very same intron as the up transcript, so it skips the
+exon too. Swan pools all the down transcripts into one annotation: the intron
+is in it, so it is not novel and `find_es_genes()` never tests it. The same
+holds for HNRNPA1's RI (table `sl_only_ri`): the up transcript's retaining
+exon is also an exon of another down transcript.
+
+**The gene the subset adds as splicelogic only** (no reason above). The same
+check as for the 6: the up transcript's intron that runs across the down
+transcript's terminal exon, the down transcripts that have that same intron,
+and Swan's `annotation` flag for it.
+
+```{r subset_new}
+new_ids <- subset_plus$gid[is.na(subset_plus$reason)]
+sl_only_term <- term_exons[term_exons$gid %in% new_ids &
+                             term_exons$inside_up_intron, ]
+sl_only_term$intron_also_in_down <- mapply(function(gid, s, e) {
+  d <- introns[!introns$up & introns$gid == gid & introns$start == s &
+                 introns$end == e, ]
+  paste(unique(d$tx), collapse = ", ")
+}, sl_only_term$gid, sl_only_term$intron_start, sl_only_term$intron_end)
+sl_only_term$swan_annotated <- mapply(swan_annotated, "intron",
+                                      sl_only_term$intron_start,
+                                      sl_only_term$intron_end)
+sl_only_term
+```
+
+Again the up transcript's intron is in other down transcripts, so Swan does
+not test it.
+
+**The 3 Swan-only genes** (IFI44, CD44, COL8A1): the exon inside Swan's novel
+intron is in another up transcript and in no down transcript. Every exon
+inside the intron, the transcript that has it, and what splicelogic calls
+with that exon (`none`: no event):
+
+```{r only_up_exons}
+only_up_ids <- subset_plus$gid[subset_plus$reason %in%
+                                 "exon inside only in up transcripts"]
+only_up_rows <- es_df[no_version(es_df$gid) %in% only_up_ids, ]
+
+only_up_exons <- do.call(rbind, lapply(seq_len(nrow(only_up_rows)), function(i) {
+  r   <- only_up_rows[i, ]
+  gid <- no_version(r$gid)
+  ins <- tx_exons[tx_exons$gid == gid & tx_exons$start > r$start &
+                    tx_exons$end < r$end, ]
+  ins$splicelogic <- vapply(seq_len(nrow(ins)), function(j) {
+    t <- sl_df$type[sl_df$tx == ins$tx_id[j] & sl_df$start == ins$start[j] &
+                      sl_df$end == ins$end[j]]
+    if (length(t) == 0) "none" else paste(sort(unique(t)), collapse = " + ")
+  }, character(1))
+  data.frame(gene_name   = genes$gene_name[genes$gid == gid],
+             swan_up_tx  = r$tid,
+             swan_intron = paste0(r$start, "-", r$end),
+             exon_tx     = ins$tx_id,
+             exon_up     = ins$up,
+             exon        = paste0(ins$start, "-", ins$end),
+             splicelogic = ins$splicelogic)
+}))
+only_up_exons
+```
+
+Swan counts an exon of any transcript of the gene, so an up transcript
+"skips" an exon that only another up transcript has. splicelogic compares up
+transcripts with down ones only, so it never sets two up transcripts against
+each other; it compares the up transcript that has the exon with the down
+transcripts, which lack it, and what it calls depends on where the exon is in
+that up transcript:
+
+- **IFI44**: an internal exon, called as included (CIE)
+- **CD44**: that up transcript's first exon, called as an ATSS
+- **COL8A1**: three exons of that up transcript; the last one is called as
+  an ATES, the other two get no event
+
+Every plus-strand gene left with a reason:
+
+```{r subset_reasons}
+new_reason <- tapply(sl_only_term$swan_annotated, sl_only_term$gid, all)
+missing <- is.na(subset_plus$reason)
+subset_plus$reason[missing] <-
+  ifelse(new_reason[subset_plus$gid[missing]],
+         "skipping intron also in a down transcript", "other")
+stopifnot(!anyNA(subset_plus$reason))
+write.csv(subset_plus, file.path(out_dir, "es_subset_plus_mismatch.csv"),
+          row.names = FALSE)
+table(subset_plus$reason, subset_plus$status)
+```
+
+## 8. Side by side
+
+Swan's gene graph (dashed: edges found only in up transcripts) next to every
+event splicelogic calls in the gene with `find_all_events()`, and under them
+a table of what each tool calls in the gene:
+
+- **Swan**: `find_es_genes()` and `find_ir_genes()`, with the up transcript
+  and the edge (intron for ES, exon for IR) of each call
+- **splicelogic**: SE + CSE + MXE and RI, the two lists compared, with the
+  number of exons of each event type; and every event type it calls in the
+  gene
+
+The genes:
+
+- **detected by both**: one ES gene, the one with the fewest transcripts
+- **minus strand, splicelogic only**: one ES gene, the one with the fewest
+  transcripts
+- **plus strand**: every gene that does not match (section 6), and the one
+  the ATSS / ATES subset adds (section 7), grouped by reason
+
+```{r plot_genes}
+n_tx <- tapply(sl_exons$tx_id, no_version(sl_exons$gene_id),
+               function(x) length(unique(x)))
+fewest_tx <- function(d) d[order(n_tx[d$gid], d$gene_name), ][1, ]
+
+both_gene  <- fewest_tx(gene_match[gene_match$event == "ES" &
+                                     gene_match$status == "both", ])
+minus_gene <- fewest_tx(gene_match[gene_match$event == "ES" &
+                                     gene_match$strand == "-" &
+                                     gene_match$status == "splicelogic only", ])
+
+plus_rows <- rbind(
+  plus_mismatch[, c("event", "status", "gene_name", "gid", "reason")],
+  cbind(event = "ES with the ATSS / ATES subset",
+        subset_plus[!subset_plus$gid %in% plus_mismatch$gid,
+                    c("status", "gene_name", "gid", "reason")])
+)
+
+plot_genes <- rbind(
+  data.frame(group = "Detected by both", gene_name = both_gene$gene_name,
+             gid = both_gene$gid, note = "ES: both"),
+  data.frame(group = "Minus strand: splicelogic only",
+             gene_name = minus_gene$gene_name, gid = minus_gene$gid,
+             note = "ES: splicelogic only (Swan calls nothing on the minus strand)"),
+  data.frame(group = paste0("Plus strand, ", plus_rows$status, ": ",
+                            plus_rows$reason),
+             gene_name = plus_rows$gene_name, gid = plus_rows$gid,
+             note = paste0(plus_rows$event, ": ", plus_rows$status, ", ",
+                           plus_rows$reason))
+)
+
+# one plot per gene: a gene with two mismatches (HNRNPA1, ES and IR) keeps
+# the group of the first, with both reasons in its note
+notes <- tapply(plot_genes$note, plot_genes$gid, paste, collapse = "\n")
+plot_genes <- plot_genes[!duplicated(plot_genes$gid), ]
+plot_genes$note <- unname(notes[plot_genes$gid])
+
+group_order <- c(
+  "Detected by both",
+  "Minus strand: splicelogic only",
+  "Plus strand, splicelogic only: skipping intron also in a down transcript",
+  "Plus strand, splicelogic only: retaining exon also in a down transcript",
+  "Plus strand, Swan only: exon inside only in up transcripts",
+  "Plus strand, Swan only: down transcript's first exon: alternative first exon",
+  "Plus strand, Swan only: down transcript's last exon: alternative last exon"
+)
+plot_genes <- plot_genes[order(match(plot_genes$group, group_order),
+                               plot_genes$gene_name), ]
+rownames(plot_genes) <- NULL
+plot_genes[, c("group", "gene_name", "gid")]
+```
+
+Swan's plots, saved as PNGs:
+
+```{python swan_plots, results='hide'}
+for gid in r.plot_genes['gid']:
+    sg.plot_graph(gid, indicate_novel=True)
+    plt.savefig(f'{r.plot_dir}/{gid}.png', dpi=150, bbox_inches='tight')
+    plt.close('all')
+```
+
+The table under each plot:
+
+```{r gene_table}
+detected <- function(x) ifelse(x, "detected", "not detected")
+# Swan: each call's up transcript and edge
+swan_details <- function(d) {
+  if (nrow(d) == 0) return("")
+  paste0(d$tid, ": ", d$start, "-", d$end, collapse = "; ")
+}
+# splicelogic: the number of exons of each event type
+sl_details <- function(d) {
+  if (nrow(d) == 0) return("")
+  n <- tapply(paste(d$start, d$end), d$type, function(x) length(unique(x)))
+  paste0(names(n), ": ", n, ifelse(n == 1, " exon", " exons"), collapse = ", ")
+}
+wrap <- function(x) vapply(strwrap(x, 70, simplify = FALSE), paste,
+                           character(1), collapse = "\n")
+
+gene_table <- function(gid) {
+  es <- es_df[no_version(es_df$gid) == gid, ]
+  ir <- ir_df[no_version(ir_df$gid) == gid, ]
+  sl <- sl_df[sl_df$gid == gid, ]
+  sl_es <- sl[sl$type %in% c("se", "cse", "mxe"), ]
+  sl_ri <- sl[sl$type == "ri", ]
+  data.frame(
+    tool    = c("Swan", "Swan", "splicelogic", "splicelogic", "splicelogic"),
+    call    = c("find_es_genes()", "find_ir_genes()", "SE + CSE + MXE", "RI",
+                "all event types"),
+    gene    = c(detected(nrow(es) > 0), detected(nrow(ir) > 0),
+                detected(nrow(sl_es) > 0), detected(nrow(sl_ri) > 0), ""),
+    details = wrap(c(swan_details(es), swan_details(ir), sl_details(sl_es),
+                     sl_details(sl_ri),
+                     paste(sort(unique(sl$type)), collapse = " + ")))
+  )
+}
+
+gene_table(plot_genes$gid[1])
+```
+
+```{r side_by_side_fun}
+side_by_side <- function(g) {
+  g_exons  <- sl_pre[no_version(sl_pre$gene_id) == g$gid]
+  g_events <- find_all_events(g_exons, verbose = FALSE)
+  sl_plot <- if (length(g_events) > 0) {
+    plot_transcripts(g_events, g_exons, rescale_introns = TRUE)
+  } else {
+    ggplot() + annotate("text", x = 0, y = 0, label = "no events") +
+      theme_void()
+  }
+  swan_png  <- png::readPNG(file.path(plot_dir, paste0(g$gid, ".png")))
+  swan_plot <- wrap_elements(full = grid::rasterGrob(swan_png))
+  table_grob <- gridExtra::tableGrob(
+    gene_table(g$gid), rows = NULL,
+    theme = gridExtra::ttheme_minimal(base_size = 11,
+                                      core = list(fg_params = list(hjust = 0, x = 0.02)))
+  )
+
+  ((swan_plot + ggtitle("Swan gene graph")) |
+     (sl_plot + ggtitle("splicelogic find_all_events()"))) /
+    wrap_elements(full = table_grob) +
+    plot_layout(heights = c(3, 1.3)) +
+    plot_annotation(
+      title = sprintf("%s (%s), %s strand", g$gene_name, g$gid,
+                      genes$strand[genes$gid == g$gid]),
+      subtitle = g$note
+    )
+}
+```
+
+Under each figure, the outputs themselves, filtered to the gene, so it shows
+whether the gene is in them or not:
+
+- **Swan**: `find_es_genes()` and `find_ir_genes()` as returned (`es_raw`,
+  `ir_raw`): one row per exon the edge skips (or intron it retains), so the
+  same up transcript and edge can repeat
+- **splicelogic**: `find_all_events()` (`sl_ev`), once for the types
+  compared with Swan's ES (SE, CSE, MXE), once for RI, and once for ATSS and
+  ATES (section 7)
+
+```{r gene_outputs}
+es_out <- py$es_raw
+ir_out <- py$ir_raw
+sl_out <- as.data.frame(sl_ev)[, c("seqnames", "start", "end", "strand",
+                                   "gene_id", "tx_id", "exon_rank", "estimate",
+                                   "event_type", "event_tx_id",
+                                   "event_estimate")]
+
+# one output as a table under the call that gives it, or "0 rows"
+output_table <- function(call, d) {
+  cat("\n\n`", call, "`\n\n", sep = "")
+  if (nrow(d) == 0) {
+    cat("**0 rows**: the gene is not in this output\n\n")
+  } else {
+    cat(knitr::kable(d, format = "pipe", row.names = FALSE, digits = 3),
+        sep = "\n")
+  }
+}
+
+gene_outputs <- function(gid) {
+  gene_id <- sl_exons$gene_id[no_version(sl_exons$gene_id) == gid][1]
+  sl_gene <- sl_out[sl_out$gene_id == gene_id, ]
+  sl_call <- function(types) {
+    sprintf('find_all_events(sl_pre) |> filter(gene_id == "%s", event_type %%in%% c(%s))',
+            gene_id, paste0('"', types, '"', collapse = ", "))
+  }
+  output_table(sprintf("sg.find_es_genes().query(\"gid == '%s'\")", gid),
+               es_out[no_version(es_out$gid) == gid, ])
+  output_table(sprintf("sg.find_ir_genes().query(\"gid == '%s'\")", gid),
+               ir_out[no_version(ir_out$gid) == gid, ])
+  for (types in list(c("se", "cse", "mxe"), "ri", c("atss", "ates"))) {
+    output_table(sl_call(types), sl_gene[sl_gene$event_type %in% types, ])
+  }
+}
+```
+
+```{r side_by_side, results='asis', fig.width=16, fig.height=8}
+for (grp in unique(plot_genes$group)) {
+  cat("\n\n### ", grp, "\n\n", sep = "")
+  for (i in which(plot_genes$group == grp)) {
+    g <- plot_genes[i, ]
+    cat("\n\n#### ", g$gene_name, " (", g$gid, ")\n\n", sep = "")
+    print(side_by_side(g))
+    gene_outputs(g$gid)
+    cat("\n\n")
+  }
+}
+```
+
+## 9. Summary
+
+splicelogic and Swan side by side: what they have in common, where they
+differ, the genes both call, and every plus-strand gene they do not agree on,
+with why. The numbers in this section are computed from the sections above;
+section 10 has the same numbers in tables.
+
+```{r summary_numbers}
+# the plus-strand gene lists compared in section 4
+plus_es <- gene_match[gene_match$strand == "+" & gene_match$event == "ES", ]
+plus_ir <- gene_match[gene_match$strand == "+" & gene_match$event == "IR", ]
+n_both <- function(d) sum(d$status == "both")
+n_swan <- function(d) sum(d$swan)
+n_sl   <- function(d) sum(d$splicelogic)
+both_any  <- union(plus_es$gid[plus_es$status == "both"],
+                   plus_ir$gid[plus_ir$status == "both"])
+subset_es <- es_variants[es_variants$event == "+ ATSS / ATES subset" &
+                           es_variants$strand == "+", ]
+minus <- gene_match[gene_match$strand == "-", ]
+
+# the plus-strand genes that do not match, by reason (section 6)
+by_reason <- function(event, status, reason) {
+  plus_mismatch[plus_mismatch$event == event &
+                  plus_mismatch$status == status &
+                  plus_mismatch$reason == reason, ]
+}
+mm_sl_es   <- by_reason("ES", "splicelogic only",
+                        "skipping intron also in a down transcript")
+mm_sl_ir   <- by_reason("IR", "splicelogic only",
+                        "retaining exon also in a down transcript")
+mm_first   <- by_reason("ES", "Swan only",
+                        "down transcript's first exon: alternative first exon")
+mm_last    <- by_reason("ES", "Swan only",
+                        "down transcript's last exon: alternative last exon")
+mm_only_up <- by_reason("ES", "Swan only", "exon inside only in up transcripts")
+# and the one the ATSS / ATES subset adds (section 7)
+mm_subset  <- subset_plus[!subset_plus$gid %in% plus_mismatch$gid, ]
+
+# every plus-strand mismatch is in one of these groups
+stopifnot(nrow(mm_sl_es) + nrow(mm_sl_ir) + nrow(mm_first) + nrow(mm_last) +
+            nrow(mm_only_up) == nrow(plus_mismatch))
+
+names_of <- function(d) paste(sort(unique(d$gene_name)), collapse = ", ")
+```
+
+### What is the same
+
+- **The same question.** Both compare two groups of transcripts of a gene and
+  report what one group does that the other does not. Here the down
+  transcripts are Swan's annotation and the up transcripts its
+  transcriptome, so both report what the up transcripts do relative to the
+  down ones.
+- **The same kind of input.** Both work from whole transcript structures
+  (each transcript's exons: a GTF for Swan, a `GRanges` for splicelogic), not
+  from junction or exon counts.
+- **The same two event types.** Swan's exon skipping (ES) is splicelogic's
+  SE + CSE + MXE, and Swan's intron retention (IR) is splicelogic's RI. On
+  the plus strand they call the same `r n_both(plus_es)` ES genes and the same
+  `r n_both(plus_ir)` IR genes (below).
+- **The same answer for alternative first / last exons.** When Swan's ES is a
+  down transcript's first or last exon, skipped, splicelogic calls an ATSS or
+  ATES for the same up transcript, the same down transcript and the same
+  intron: `r sum(swan_alt$in_subset)` of `r nrow(swan_alt)` Swan rows
+  (section 7).
+- **Both draw a gene.** Swan as a graph of its splice sites, with the edges
+  found only in up transcripts dashed; splicelogic as its transcripts, with
+  each event marked (section 8).
+
+### What is different
+
+- **Event types.** Swan calls 2, ES and IR, with `find_es_genes()` and
+  `find_ir_genes()`; splicelogic calls 11. Swan has no call for:
+  - IE, CIE, SI: it tests only the edges missing from the annotation, that
+    is, what the up transcripts do; the reverse would need the graph built
+    the other way round
+  - MXE as its own type: it is an ES for Swan
+  - A5SS, A3SS: a moved splice site is a new edge in the graph, drawn dashed,
+    but is reported only when the new intron also spans a whole exon, and
+    then as an ES
+  - ATSS, ATES: Swan's only start / end analysis is
+    `die_gene_test(kind = "tss")` / `"tes"`, a test from read counts of
+    whether start / end site usage changes between two conditions, not an
+    event call
+- **What an up transcript is compared with.** splicelogic pairs each up
+  transcript with each down transcript. Swan pools all the down transcripts
+  into one annotation, and tests an up transcript's intron (exon) only if no
+  down transcript has it. Because of this, `r nrow(mm_sl_es)` plus-strand ES
+  genes and `r nrow(mm_sl_ir)` IR gene are splicelogic only, and 1 more ES
+  gene with the ATSS / ATES subset.
+- **Which exon counts as skipped.** Swan: any exon that sits inside the novel
+  intron, from any transcript of the gene, so also an exon only other up
+  transcripts have, and also a first or last exon. splicelogic: an internal
+  exon of the paired down transcript; a skipped first / last exon is an ATSS
+  / ATES. Because of this, `r sum(plus_es$status == "Swan only")` plus-strand
+  ES genes are Swan only (section 6).
+- **Strand.** Swan calls nothing on the minus strand (`range(v1+1, v2)` is
+  empty there, section 5); splicelogic calls both strands. So the
+  `r sum(minus$event == "ES")` ES and `r sum(minus$event == "IR")` IR genes
+  splicelogic calls on the minus strand are all splicelogic only.
+- **Output.** Swan stops at the first call in a gene and returns the gene,
+  the up transcript and the edge. splicelogic returns every exon of every
+  event, for every up / down pair, with its coordinates, both transcripts and
+  their estimates. So the comparison is by gene, not by event.
+- **Input.** splicelogic takes the results table of any DTU method, and the
+  sign of each transcript's estimate sets up and down. Swan takes GTFs (and
+  counts and sample metadata for its tests), and which transcripts are the
+  annotation is set by hand.
+- **Edge cases.** Swan raises an `AttributeError` instead of returning an
+  empty table when it finds nothing, and its IR does not check that the
+  retained intron is of the same gene (no effect here: no gene is Swan only
+  for IR).
+
+### Genes both call (plus strand)
+
+The minus strand is left out: Swan calls nothing there.
+
+- **ES**: `r n_both(plus_es)` genes called by both, of Swan's
+  `r n_swan(plus_es)` ES genes and splicelogic's `r n_sl(plus_es)` SE + CSE +
+  MXE genes
+- **IR**: `r n_both(plus_ir)` genes called by both, of Swan's
+  `r n_swan(plus_ir)` IR genes and splicelogic's `r n_sl(plus_ir)` RI genes
+- **ES or IR**: `r length(both_any)` genes called by both
+- **ES with the ATSS / ATES subset added** (section 7): `r n_both(subset_es)`
+  genes called by both, of Swan's `r n_swan(subset_es)` and splicelogic's
+  `r n_sl(subset_es)`
+
+### Every plus-strand gene that does not match, and why
+
+- **splicelogic only, ES (`r nrow(mm_sl_es)`)**: `r names_of(mm_sl_es)`.
+  splicelogic calls an SE: the up transcript skips an exon of the down
+  transcript it is paired with. But another down transcript has the very same
+  intron as the up transcript, so it skips the exon too. Swan pools the down
+  transcripts, finds the intron in its annotation, and never tests it.
+- **splicelogic only, IR (`r nrow(mm_sl_ir)`)**: `r names_of(mm_sl_ir)`. The
+  same: the up transcript's exon that retains the intron is also an exon of
+  another down transcript, so Swan never tests it.
+- **Swan only, ES, alternative first exon (`r nrow(mm_first)`)**:
+  `r names_of(mm_first)`. The exon inside Swan's novel intron is the down
+  transcript's first exon. For splicelogic a first exon is not skipped but
+  replaced: it calls an ATSS for the same up / down pair.
+- **Swan only, ES, alternative last exon (`r nrow(mm_last)`)**:
+  `r names_of(mm_last)`. The same with the down transcript's last exon:
+  splicelogic calls an ATES.
+- **Swan only, ES, exon only in up transcripts (`r nrow(mm_only_up)`)**:
+  `r names_of(mm_only_up)`. The exon inside Swan's novel intron is in other
+  up transcripts and in no down transcript. Swan counts an exon of any
+  transcript; splicelogic never sets two up transcripts against each other.
+  It compares the up transcript that has the exon with the down transcripts,
+  and calls: IFI44 a CIE, CD44 an ATSS, COL8A1 an ATES for one of its three
+  exons and nothing for the other two (section 7).
+- **splicelogic only once the ATSS / ATES subset is added
+  (`r nrow(mm_subset)`)**: `r names_of(mm_subset)`. As for the
+  `r nrow(mm_sl_es)` above: the up transcript's intron across the down
+  transcript's last exon is also in other down transcripts, so Swan never
+  tests it.
+
+One row per gene and group. `splicelogic calls`: for a splicelogic-only gene,
+the event types it calls that Swan does not; for a Swan-only gene, what
+splicelogic calls for the same up / down pair (for an exon only in up
+transcripts, with that exon).
+
+```{r mismatch_list}
+# the event types in column `col` of `d`, for the rows whose `by` is `key`
+calls_for <- function(key, d, col, by = "gid") {
+  x <- unlist(strsplit(as.character(d[[col]][d[[by]] == key]), " \\+ "))
+  x <- x[!is.na(x) & x != "" & x != "none"]
+  if (length(x) == 0) "none" else paste(sort(unique(x)), collapse = " + ")
+}
+mm_rows <- function(d, called_by, event, why, calls) {
+  data.frame(called_by = called_by, event = event, gene_name = d$gene_name,
+             gid = d$gid, why = why, splicelogic_calls = calls)
+}
+
+mismatch_list <- rbind(
+  mm_rows(mm_sl_es, "splicelogic only", "ES",
+          "skipping intron also in another down transcript",
+          vapply(mm_sl_es$gid, calls_for, "", d = sl_only_es, col = "type")),
+  mm_rows(mm_sl_ir, "splicelogic only", "IR",
+          "retaining exon also in another down transcript", "ri"),
+  mm_rows(mm_subset, "splicelogic only", "ES with ATSS / ATES subset",
+          "skipping intron also in another down transcript",
+          vapply(mm_subset$gid, calls_for, "", d = sl_only_term, col = "type")),
+  mm_rows(mm_first, "Swan only", "ES",
+          "skipped exon is the down transcript's first exon",
+          vapply(mm_first$gid, calls_for, "", d = swan_only_es,
+                 col = "splicelogic_pair")),
+  mm_rows(mm_last, "Swan only", "ES",
+          "skipped exon is the down transcript's last exon",
+          vapply(mm_last$gid, calls_for, "", d = swan_only_es,
+                 col = "splicelogic_pair")),
+  mm_rows(mm_only_up, "Swan only", "ES",
+          "skipped exon only in other up transcripts",
+          vapply(mm_only_up$gene_name, calls_for, "", d = only_up_exons,
+                 col = "splicelogic", by = "gene_name"))
+)
+rownames(mismatch_list) <- NULL
+write.csv(mismatch_list, file.path(out_dir, "mismatch_list.csv"),
+          row.names = FALSE)
+knitr::kable(mismatch_list)
+```
+
+## 10. Summary tables
+
+All numbers are for the Glinos PTBP1 DTU transcripts at FDR < 0.05, as found
+in the sections above (written by hand, not computed here).
+
+### Input and gene lists
+
+| | |
+|---|---|
+| DTU transcripts (FDR < 0.05, genes with >= 1 up and >= 1 down) | 1,124 transcripts in 490 genes (249 plus strand, 241 minus strand) |
+| splicelogic SE + CSE + MXE genes | 159 (86 plus, 73 minus) |
+| splicelogic RI genes | 32 (13 plus, 19 minus) |
+| Swan `find_es_genes()` genes | 112 (all plus strand) |
+| Swan `find_ir_genes()` genes | 12 (all plus strand) |
+
+### Gene lists compared (section 4)
+
+Compared by gene, not by event: Swan stops at the first call in a gene.
+
+| comparison | strand | both | splicelogic only | Swan only |
+|---|---|---|---|---|
+| Swan ES vs splicelogic SE + CSE + MXE | minus | 0 | 73 | 0 |
+| | plus | 80 | 6 | 32 |
+| Swan IR vs splicelogic RI | minus | 0 | 19 | 0 |
+| | plus | 12 | 1 | 0 |
+
+### Why genes do not match (sections 5 and 6)
+
+| genes | strand | called by | why | what splicelogic calls there |
+|---|---|---|---|---|
+| 73 ES + 19 RI | minus | splicelogic only | Swan calls nothing on the minus strand: it looks for the skipped exon (retained intron) in `range(v1+1, v2)`, and every minus-strand edge has `v1 > v2`, so the range is empty | SE / CSE / MXE, RI |
+| 6 ES: CD46, FXR1, CALU, CALD1, SPTAN1, HNRNPA1 | plus | splicelogic only | the up transcript's skipping intron is also in another down transcript, which skips the exon too; Swan pools all down transcripts into its annotation, so the intron is not novel and never tested | SE (CALU also MXE) |
+| 1 IR: HNRNPA1 | plus | splicelogic only | the up transcript's retaining exon is also an exon of another down transcript: not novel, never tested | RI |
+| 10 ES | plus | Swan only | the exon inside Swan's novel intron is the down transcript's **first** exon (alternative first exon); for splicelogic it is terminal, not internal, so not an SE | ATSS, for the same up / down pair |
+| 19 ES | plus | Swan only | the exon inside Swan's novel intron is the down transcript's **last** exon (alternative last exon) | ATES, for the same up / down pair |
+| 3 ES: IFI44, CD44, COL8A1 | plus | Swan only | the exon inside Swan's novel intron is only in another **up** transcript; Swan counts an exon of any transcript of the gene, splicelogic never sets two up transcripts against each other | IFI44: CIE; CD44: ATSS; COL8A1: ATES for one exon, nothing for two |
+
+### ATSS and ATES (section 7)
+
+Most ATSS / ATES move the start or end of a terminal exon and are not an exon
+skipping for Swan. Only 171 of the 1,251 up / down pairs with an ATSS or ATES
+have the down transcript's first (last) exon wholly inside an up transcript's
+intron, which is what Swan calls ES.
+
+| splicelogic ES list | strand | both | splicelogic only | Swan only |
+|---|---|---|---|---|
+| SE + CSE + MXE (the comparison used) | plus | 80 | 6 | 32 |
+| | minus | 0 | 73 | 0 |
+| + all ATSS / ATES | plus | 112 | 133 | 0 |
+| | minus | 0 | 240 | 0 |
+| + ATSS / ATES subset (down terminal exon inside an up intron) | plus | 109 | 7 | 3 |
+| | minus | 0 | 100 | 0 |
+
+With the subset:
+
+- the 29 alternative first / last exon genes are all called by splicelogic,
+  with the same up transcript, down transcript and intron Swan reports (30 of
+  30 Swan rows)
+- the 3 Swan-only genes left are IFI44, CD44 and COL8A1 (exon only in up
+  transcripts)
+- one new splicelogic-only gene, MEG3: the up transcript's intron across the
+  down transcript's last exon is also in four other down transcripts, so Swan
+  does not test it, as for the 6 above
+
+### Swan behaviours behind the differences
+
+From `find_es_genes()` / `find_ir_genes()` in `swangraph.py` (Swan 3.2, run
+as released):
+
+| behaviour | effect here |
+|---|---|
+| only novel edges are tested: an intron (exon) of an up transcript that no down transcript has, pooled over all down transcripts | 7 plus-strand splicelogic-only genes (6 ES + MEG3 with the subset) and HNRNPA1's RI |
+| the skipped exon can come from any transcript of the gene, up or down | 3 Swan-only genes (IFI44, CD44, COL8A1) |
+| a skipped terminal exon counts as exon skipping | 29 Swan-only genes, ATSS / ATES in splicelogic |
+| `range(v1+1, v2)` is empty when `v1 > v2` | nothing called on the minus strand: 73 ES and 19 RI genes |
+| at most one call per gene | the comparison is by gene |
+| IR does not check that the retained intron is of the same gene | no effect on the gene lists: no gene is Swan only for IR |
+| raises `AttributeError` instead of returning an empty table when nothing is found | caught and read as no calls |
+
+## Files written
+
+```{r files_written}
+files <- list.files(out_dir, recursive = TRUE, full.names = TRUE)
+data.frame(file = sub(paste0(out_dir, "/"), "", files),
+           MB   = round(file.size(files) / 1e6, 2))
+```
+
+```{r session_info}
+sessionInfo()
+```
